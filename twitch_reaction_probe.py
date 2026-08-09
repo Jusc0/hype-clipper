@@ -114,18 +114,34 @@ class PreviewServer:
         handler = functools.partial(
             QuietPreviewHandler, directory=str(directory.resolve())
         )
+        self.lan_ip = self._detect_lan_ip()
         try:
             self.server = http.server.ThreadingHTTPServer(
-                ("127.0.0.1", preferred_port), handler
+                ("0.0.0.0", preferred_port), handler
             )
         except OSError:
-            self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            self.server = http.server.ThreadingHTTPServer(("0.0.0.0", 0), handler)
         self.server.daemon_threads = True
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    @staticmethod
+    def _detect_lan_ip():
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect(("192.0.2.1", 80))
+            return probe.getsockname()[0]
+        except OSError:
+            return "127.0.0.1"
+        finally:
+            probe.close()
 
     @property
     def url(self):
         return f"http://127.0.0.1:{self.server.server_port}/reactions.html"
+
+    @property
+    def phone_url(self):
+        return f"http://{self.lan_ip}:{self.server.server_port}/reactions.html"
 
     def start(self):
         self.thread.start()
@@ -1385,7 +1401,8 @@ def main():
         else:
             print(f"{args.duration_minutes:g}分後に自動終了します（途中終了は Ctrl+C）")
         print(f"output: {out_dir.resolve()}\n")
-        print(f"live preview: {preview_server.url}\n")
+        print(f"PC preview   : {preview_server.url}")
+        print(f"phone preview: {preview_server.phone_url}\n")
         next_buffer_check = time.monotonic()
         next_preview_update = time.monotonic() + args.preview_interval_minutes * 60
         while not stop_event.is_set():
