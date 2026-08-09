@@ -27,6 +27,8 @@ from faster_whisper.vad import VadOptions, get_speech_timestamps
 
 IRC_HOST = "irc.chat.twitch.tv"
 IRC_PORT = 6697
+STREAM_QUALITY = "720p,720p60,best"
+OUTPUT_VIDEO_HEIGHT = 720
 HIGHLIGHT_SECONDS = 30.0
 BUFFER_SAFETY_SECONDS = 30.0
 BUFFER_SEGMENT_SAFETY_SECONDS = 10.0
@@ -442,7 +444,7 @@ def create_video_highlight(source_path, output_path, start_seconds, duration_sec
         "-ss", f"{start_seconds:.3f}", "-i", str(source_path),
         "-t", f"{duration_seconds:.3f}",
         "-map", "0:v:0", "-map", "0:a:0?",
-        "-vf", "scale=-2:480",
+        "-vf", f"scale=-2:{OUTPUT_VIDEO_HEIGHT}",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "24",
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart", str(output_path),
@@ -763,7 +765,7 @@ class AudioCapture:
         self.chunk_dir.mkdir(parents=True, exist_ok=True)
         self.video_segment_dir.mkdir(parents=True, exist_ok=True)
         self.streamlink = subprocess.Popen(
-            ["streamlink", "--stdout", self.channel_url, "480p,480p60,best"],
+            ["streamlink", "--stdout", self.channel_url, STREAM_QUALITY],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             bufsize=0,
