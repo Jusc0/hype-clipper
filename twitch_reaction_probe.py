@@ -1379,6 +1379,11 @@ def main():
         default=0.0,
         help="Twitch stream start as Unix seconds for display timestamps",
     )
+    parser.add_argument(
+        "--preserve-published-on-start",
+        action="store_true",
+        help="keep the current HTML and highlight videos during a worker restart",
+    )
     parser.add_argument("--out", default="reaction_session")
     args = parser.parse_args()
 
@@ -1449,17 +1454,23 @@ def main():
     legacy_recording_path = out_dir / "recording.wav"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    for p in (chat_path, speech_path, transcript_path, detailed_transcript_path, html_path,
-              legacy_media_path, legacy_highlight_path, speech_highlight_path,
-              chat_highlight_path, *ranked_highlight_paths,
-              *preview_highlight_paths,
-              speech_transcript_path, chat_transcript_path,
-              legacy_recording_path):
+    reset_paths = [
+        chat_path, speech_path, transcript_path, detailed_transcript_path,
+        legacy_media_path, legacy_highlight_path, speech_highlight_path,
+        chat_highlight_path, speech_transcript_path, chat_transcript_path,
+        legacy_recording_path,
+    ]
+    if not args.preserve_published_on_start:
+        reset_paths.extend([
+            html_path, *ranked_highlight_paths, *preview_highlight_paths,
+        ])
+    for p in reset_paths:
         if p.exists():
             p.unlink()
-    for pattern in ("highlight_chat_[0-9]*.mp4", "preview_*.mp4"):
-        for path in out_dir.glob(pattern):
-            path.unlink()
+    if not args.preserve_published_on_start:
+        for pattern in ("highlight_chat_[0-9]*.mp4", "preview_*.mp4"):
+            for path in out_dir.glob(pattern):
+                path.unlink()
     if chunk_dir.exists():
         shutil.rmtree(chunk_dir)
     if clip_dir.exists():

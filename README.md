@@ -150,7 +150,7 @@ python twitch_reaction_probe.py --reaction-start 2 --reaction-end 6
 
 ## VPS版（Docker Compose + Flask + Caddy）
 
-VPS版では、Twitchの収集・VAD・切り抜きをworkerコンテナで行い、Flaskが結果と監視操作画面を配信し、CaddyがHTTPSとパスワード保護を担当します。PCとスマホはブラウザーで見るだけです。最大2配信者を同時監視し、チャット・動画・上位10件ランキングは配信者ごとに完全分離します。
+VPS版では、Twitchの収集・VAD・切り抜きをworkerコンテナで行い、Flaskが結果と監視操作画面を配信し、CaddyがHTTPSとパスワード保護を担当します。PCとスマホはブラウザーで見るだけです。最大3配信者を同時監視し、チャット・動画・上位10件ランキングは配信者ごとに完全分離します。
 
 このVPSでは、独自ドメインがなくても次のホスト名を使用できます。`sslip.io`のDNSによって`163.44.122.195`へ解決されます。
 
@@ -181,7 +181,7 @@ HYPE_BASIC_AUTH_HASH='$2a$...'
 TWITCH_CLIENT_ID=...
 TWITCH_CLIENT_SECRET=...
 TWITCH_CHANNEL=yaritaiji
-MAX_CHANNELS=2
+MAX_CHANNELS=3
 ```
 
 ### 起動
@@ -222,4 +222,4 @@ docker compose logs --tail=100 worker
 
 ### 1GB VPS向け設定
 
-`compose.yaml`では最大2配信者を収めるworker全体を700MB、Flask 112MB、Caddy 96MBに制限しています。書き起こしは行わず、Gunicornは1 worker・2 threadsです。複数配信者の720p切り抜き生成は共有ロックで直列化し、同時エンコードによるCPU集中を避けます。ホスト側には2GB程度のswapを用意してください。
+`compose.yaml`では最大3配信者を収めるworker全体を700MB、Flask 112MB、Caddy 96MBに制限しています。書き起こしは行わず、Gunicornは1 worker・2 threadsです。複数配信者の720p切り抜き生成は共有ロックで直列化し、同時エンコードによるCPU集中を避けます。ホスト側には2GB程度のswapを用意してください。

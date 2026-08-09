@@ -89,7 +89,7 @@ def create_app(
     control_root = Path(configured_control or output_root / "control").resolve()
     channels_root = output_root / "channels"
     channels_file = control_root / "channels.json"
-    max_channels = max(1, int(os.environ.get("MAX_CHANNELS", "2")))
+    max_channels = max(1, int(os.environ.get("MAX_CHANNELS", "3")))
     config_lock = threading.Lock()
     app = Flask(__name__)
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)

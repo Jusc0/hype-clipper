@@ -37,9 +37,13 @@ class WorkerTests(unittest.TestCase):
                     clear=False,
                 ):
                     command = vps_worker.build_probe_command(
-                        "yaritaiji", Path(temporary) / "yaritaiji", 1234.5
+                        "yaritaiji",
+                        Path(temporary) / "yaritaiji",
+                        1234.5,
+                        preserve_published=True,
                     )
         self.assertIn("--no-preview-server", command)
+        self.assertIn("--preserve-published-on-start", command)
         self.assertEqual(command[command.index("--channel") + 1], "yaritaiji")
         self.assertEqual(command[command.index("--highlight-seconds") + 1], "30")
         self.assertEqual(command[command.index("--preroll-seconds") + 1], "5")
@@ -128,7 +132,7 @@ class WebTests(unittest.TestCase):
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    def test_dashboard_adds_two_channels_and_rejects_third(self):
+    def test_dashboard_adds_three_channels_and_rejects_fourth(self):
         page = self.client.get("/")
         self.assertEqual(page.status_code, 200)
         self.assertNotIn("<h1>Hype Clipper</h1>", page.get_data(as_text=True))
@@ -142,11 +146,13 @@ class WebTests(unittest.TestCase):
         self.assertNotIn("別タブで開く", page.get_data(as_text=True))
         self.assertEqual(self.add_channel("yaritaiji").status_code, 202)
         self.assertEqual(self.add_channel("SHAKA").status_code, 202)
-        third = self.add_channel("third_channel")
-        self.assertEqual(third.status_code, 409)
+        self.assertEqual(self.add_channel("third_channel").status_code, 202)
+        fourth = self.add_channel("fourth_channel")
+        self.assertEqual(fourth.status_code, 409)
         channels = self.client.get("/api/channels").json["channels"]
         self.assertEqual(
-            [item["channel"] for item in channels], ["yaritaiji", "shaka"]
+            [item["channel"] for item in channels],
+            ["yaritaiji", "shaka", "third_channel"],
         )
 
     def test_delete_removes_channel(self):

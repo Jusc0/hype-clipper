@@ -32,7 +32,7 @@ STATUS_FILE = DATA_DIR / "service_status.json"
 CHANNELS_ROOT = DATA_DIR / "channels"
 CONTROL_DIR = Path(os.environ.get("HYPE_CONTROL_DIR", "/control"))
 CHANNELS_FILE = CONTROL_DIR / "channels.json"
-MAX_CHANNELS = max(1, int(os.environ.get("MAX_CHANNELS", "2")))
+MAX_CHANNELS = max(1, int(os.environ.get("MAX_CHANNELS", "3")))
 JST = timezone(timedelta(hours=9), "JST")
 
 
@@ -280,6 +280,7 @@ def build_probe_command(
     channel: str,
     output_dir: Path | None = None,
     stream_started_at_epoch: float = 0.0,
+    preserve_published: bool = False,
 ) -> list[str]:
     output_dir = output_dir or DATA_DIR
     command = [
@@ -305,6 +306,8 @@ def build_probe_command(
         ("SEGMENT_SECONDS", "--segment-seconds"),
     ):
         add_numeric_option(command, env_name, option)
+    if preserve_published:
+        command.append("--preserve-published-on-start")
     return command
 
 
@@ -387,6 +390,7 @@ def main() -> int:
     child_env["TWITCH_OAUTH_TOKEN"] = access_token
     active: dict[str, dict] = {}
     completed: dict[str, str] = {}
+    cold_start_requests = load_desired_channels(default_channel)
     shutdown_requested = False
 
     def request_shutdown(_signum, _frame):
@@ -418,13 +422,23 @@ def main() -> int:
         for channel, request_id in desired.items():
             if channel in active or completed.get(channel) == request_id:
                 continue
-            purge_channel_data(channel)
             output_dir = channel_data_dir(channel)
+            preserve_published = (
+                cold_start_requests.pop(channel, None) == request_id
+                and (output_dir / "reactions.html").is_file()
+            )
+            if preserve_published:
+                output_dir.mkdir(parents=True, exist_ok=True)
+            else:
+                purge_channel_data(channel)
             stream_started_at = get_stream_started_at_epoch(
                 channel, access_token, client_id
             )
             command = build_probe_command(
-                channel, output_dir, stream_started_at
+                channel,
+                output_dir,
+                stream_started_at,
+                preserve_published=preserve_published,
             )
             write_channel_status(channel, "starting")
             child = subprocess.Popen(

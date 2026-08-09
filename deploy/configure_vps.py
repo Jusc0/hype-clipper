@@ -72,7 +72,7 @@ def main() -> None:
         "TOP_COUNT": "10",
         "PREVIEW_INTERVAL_MINUTES": "1",
         "SEGMENT_SECONDS": "8",
-        "MAX_CHANNELS": "2",
+        "MAX_CHANNELS": "3",
     }
     args.output.write_text(
         "\n".join(f"{key}={quote_dotenv(value)}" for key, value in values.items())
