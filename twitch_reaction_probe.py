@@ -1324,6 +1324,11 @@ def main():
         default=PREVIEW_INTERVAL_SECONDS / 60.0,
         help="live HTML update interval in minutes (default: 1)",
     )
+    parser.add_argument(
+        "--no-preview-server",
+        action="store_true",
+        help="generate preview files without starting the built-in HTTP server",
+    )
     parser.add_argument("--out", default="reaction_session")
     args = parser.parse_args()
 
@@ -1412,8 +1417,10 @@ def main():
     if candidate_dir.exists():
         shutil.rmtree(candidate_dir)
 
-    preview_server = PreviewServer(out_dir)
-    preview_server.start()
+    preview_server = None
+    if not args.no_preview_server:
+        preview_server = PreviewServer(out_dir)
+        preview_server.start()
     preview_state = {}
     build_html(
         html_path, args.channel, [], args.highlight_seconds,
@@ -1465,8 +1472,11 @@ def main():
         else:
             print(f"{args.duration_minutes:g}分後に自動終了します（途中終了は Ctrl+C）")
         print(f"output: {out_dir.resolve()}\n")
-        print(f"PC preview   : {preview_server.url}")
-        print(f"phone preview: {preview_server.phone_url}\n")
+        if preview_server:
+            print(f"PC preview   : {preview_server.url}")
+            print(f"phone preview: {preview_server.phone_url}\n")
+        else:
+            print("preview files: external web service\n")
         next_buffer_check = time.monotonic()
         next_preview_update = time.monotonic() + args.preview_interval_minutes * 60
         while not stop_event.is_set():
@@ -1531,7 +1541,8 @@ def main():
                 print(f"[done] highlight  : {path}")
         print(f"[done] chat       : {chat_path}")
         print(f"[done] HTML       : {html_path}")
-        preview_server.stop()
+        if preview_server:
+            preview_server.stop()
 
 
 if __name__ == "__main__":

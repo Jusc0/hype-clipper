@@ -98,6 +98,14 @@ PowerShell:
 
 PCとスマホを同じWi-Fiへ接続すると、ターミナルに表示される `phone preview` のURLをスマホで開けます。Windowsファイアウォールの確認が表示された場合は、プライベートネットワークでのPython通信を許可してください。プレビューはスクリプト実行中だけ同じLAN内へ公開されます。
 
+収集を停止したあと、保存済み結果だけをPCやスマホで見る場合:
+
+```powershell
+.\.venv\Scripts\python.exe -u serve_preview.py
+```
+
+表示された `phone preview` をスマホで開き、終了するときは `Ctrl+C` を押します。
+
 更新間隔と表示件数も変更できます。
 
 ```powershell
@@ -120,7 +128,7 @@ reaction_session/
   audio_chunks/
 ```
 
-`reactions.html` では、重複しないチャット盛り上がり上位3件を再生できます。
+`reactions.html` では、重複しないチャット盛り上がり上位10件を再生できます。
 
 `speech_segments.jsonl`には発言内容ではなく、VADが検出した開始・終了時刻だけを保存します。個別発言は画面に表示しません。
 
@@ -131,3 +139,80 @@ python twitch_reaction_probe.py --reaction-start 2 --reaction-end 6
 ```
 
 最初は意味判定や感情分類は入れず、「時間だけで発言→反応がどこまで成立するか」を見るための版です。
+
+## VPS版（Docker Compose + Flask + Caddy）
+
+VPS版では、Twitchの収集・VAD・切り抜きをworkerコンテナで行い、Flaskが結果を配信し、CaddyがHTTPSとパスワード保護を担当します。PCとスマホはブラウザーで見るだけです。
+
+このVPSでは、独自ドメインがなくても次のホスト名を使用できます。`sslip.io`のDNSによって`163.44.122.195`へ解決されます。
+
+```text
+https://hype.163-44-122-195.sslip.io/
+```
+
+### 初期設定
+
+VPSで設定ファイルを作ります。
+
+```bash
+cp .env.example .env
+chmod 600 .env
+```
+
+Caddy用の閲覧パスワードをハッシュ化します。
+
+```bash
+docker run --rm caddy:2-alpine caddy hash-password --plaintext '任意の強いパスワード'
+```
+
+出力されたハッシュを`.env`の`HYPE_BASIC_AUTH_HASH`へ、シングルクォートを付けて保存します。続けてTwitchのClient ID、Client Secret、配信者IDを設定します。
+
+```dotenv
+HYPE_BASIC_AUTH_USER=hype
+HYPE_BASIC_AUTH_HASH='$2a$...'
+TWITCH_CLIENT_ID=...
+TWITCH_CLIENT_SECRET=...
+TWITCH_CHANNEL=yaritaiji
+```
+
+### 起動
+
+まずWeb画面を起動します。
+
+```bash
+docker compose up -d --build web caddy
+```
+
+workerを起動し、初回だけTwitchのデバイス認証を行います。
+
+```bash
+docker compose up -d --build worker
+docker compose logs -f worker
+```
+
+ログに表示されるTwitch認証URLとコードをPCまたはスマホで開きます。認証後のアクセストークンとリフレッシュトークンはDockerボリュームへ保存され、Gitや閲覧用コンテナには渡されません。
+
+配信終了時にworkerは正常停止します。次の配信で再び開始する場合は次を実行します。
+
+```bash
+docker compose start worker
+```
+
+設定やコードを変更した場合は、`start`ではなく次を使用します。
+
+```bash
+docker compose up -d --build worker
+```
+
+状態確認:
+
+```bash
+docker compose ps
+docker compose logs --tail=100 worker
+```
+
+`docker compose down`では動画・認証・Caddy証明書の名前付きボリュームは保持されます。`docker compose down -v`は保存データを削除するため使用しないでください。
+
+### 1GB VPS向け設定
+
+`compose.yaml`ではworker 560MB、Flask 112MB、Caddy 96MBのメモリ上限を設定しています。書き起こしは行わず、Gunicornは1 worker・2 threads、FFmpeg変換は既存処理のとおり直列実行です。ホスト側には2GB程度のswapを用意してください。

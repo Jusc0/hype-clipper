@@ -1,0 +1,105 @@
+services:
+  worker:
+    build:
+      context: .
+    command: ["python", "-u", "vps_worker.py"]
+    environment:
+      HYPE_DATA_DIR: /data
+      TWITCH_TOKEN_FILE: /auth/twitch_tokens.json
+      TWITCH_CLIENT_ID: ${TWITCH_CLIENT_ID}
+      TWITCH_CLIENT_SECRET: ${TWITCH_CLIENT_SECRET:-}
+      TWITCH_CHANNEL: ${TWITCH_CHANNEL}
+      DURATION_MINUTES: ${DURATION_MINUTES:-0}
+      HIGHLIGHT_SECONDS: ${HIGHLIGHT_SECONDS:-60}
+      PREROLL_SECONDS: ${PREROLL_SECONDS:-3}
+      UTTERANCE_GAP_SECONDS: ${UTTERANCE_GAP_SECONDS:-2.5}
+      PREVIOUS_LOOKBACK_SECONDS: ${PREVIOUS_LOOKBACK_SECONDS:-20}
+      TOP_COUNT: ${TOP_COUNT:-10}
+      PREVIEW_INTERVAL_MINUTES: ${PREVIEW_INTERVAL_MINUTES:-1}
+      SEGMENT_SECONDS: ${SEGMENT_SECONDS:-8}
+    volumes:
+      - hype_data:/data
+      - hype_auth:/auth
+      - model_cache:/models
+    init: true
+    restart: "on-failure:5"
+    stop_grace_period: 5m
+    mem_limit: 560m
+    memswap_limit: 1200m
+    cpus: 1.50
+    pids_limit: 256
+    logging: &rotated-logs
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  web:
+    build:
+      context: .
+    command:
+      - gunicorn
+      - --bind=0.0.0.0:8000
+      - --workers=1
+      - --threads=2
+      - --timeout=120
+      - --access-logfile=-
+      - --error-logfile=-
+      - hype_web:app
+    environment:
+      HYPE_DATA_DIR: /data
+    volumes:
+      - hype_data:/data:ro
+    expose:
+      - "8000"
+    init: true
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    mem_limit: 112m
+    memswap_limit: 224m
+    cpus: 0.25
+    pids_limit: 64
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging: *rotated-logs
+
+  caddy:
+    image: caddy:2-alpine
+    environment:
+      HYPE_DOMAIN: ${HYPE_DOMAIN}
+      HYPE_BASIC_AUTH_USER: ${HYPE_BASIC_AUTH_USER}
+      HYPE_BASIC_AUTH_HASH: ${HYPE_BASIC_AUTH_HASH}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      web:
+        condition: service_healthy
+    restart: unless-stopped
+    mem_limit: 96m
+    memswap_limit: 192m
+    cpus: 0.25
+    pids_limit: 64
+    logging: *rotated-logs
+
+volumes:
+  hype_data:
+  hype_auth:
+  model_cache:
+  caddy_data:
+  caddy_config:

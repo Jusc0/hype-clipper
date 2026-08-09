@@ -1,0 +1,15 @@
+{$HYPE_DOMAIN} {
+    encode zstd gzip
+
+    basic_auth {
+        {$HYPE_BASIC_AUTH_USER} {$HYPE_BASIC_AUTH_HASH}
+    }
+
+    header {
+        Strict-Transport-Security "max-age=31536000"
+        X-Frame-Options "DENY"
+        X-XSS-Protection "0"
+    }
+
+    reverse_proxy web:8000
+}
