@@ -1,5 +1,6 @@
 import argparse
 import http.server
+import json
 import os
 from pathlib import Path
 import socketserver
@@ -11,10 +12,6 @@ import webbrowser
 import requests
 import secrets
 
-CLIENT_ID = os.environ.get("TWITCH_CLIENT_ID", "").strip()
-CLIENT_SECRET = os.environ.get("TWITCH_CLIENT_SECRET", "").strip()
-
-
 REDIRECT_URI = "http://localhost:3000"
 
 SCOPES = [
@@ -24,6 +21,23 @@ SCOPES = [
 STATE = secrets.token_urlsafe(24)
 
 result = {}
+
+
+def load_twitch_credentials():
+    config_path = Path(__file__).with_name("config.local.json")
+    config = {}
+    if config_path.exists():
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"config.local.json を読み込めません: {exc}") from exc
+    client_id = os.environ.get("TWITCH_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("TWITCH_CLIENT_SECRET", "").strip()
+    if not client_id:
+        client_id = str(config.get("twitch_client_id", "")).strip()
+    if not client_secret:
+        client_secret = str(config.get("twitch_client_secret", "")).strip()
+    return client_id, client_secret
 
 parser = argparse.ArgumentParser(description="Authorize Twitch chat access")
 parser.add_argument(
@@ -76,9 +90,11 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
+CLIENT_ID, CLIENT_SECRET = load_twitch_credentials()
+
 if not CLIENT_ID or not CLIENT_SECRET:
     parser.error(
-        "TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET environment variables are required"
+        "TWITCH_CLIENT_ID/TWITCH_CLIENT_SECRET または config.local.json が必要です"
     )
 
 if args.duration_minutes is not None and args.duration_minutes < 0:

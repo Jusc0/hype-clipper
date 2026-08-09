@@ -26,7 +26,21 @@ Twitch Developer Consoleでアプリを作成し、OAuth Redirect URLへ次を�
 http://localhost:3000
 ```
 
-実行するPowerShellで認証情報を環境変数へ設定します。値はGitへコミットしないでください。
+`config.example.json`を`config.local.json`へコピーし、認証情報を記入します。`config.local.json`はGitの対象外です。
+
+```powershell
+Copy-Item config.example.json config.local.json
+notepad config.local.json
+```
+
+```json
+{
+  "twitch_client_id": "your-client-id",
+  "twitch_client_secret": "your-client-secret"
+}
+```
+
+環境変数を使う場合は次のように設定できます。環境変数が`config.local.json`より優先されます。
 
 ```powershell
 $env:TWITCH_CLIENT_ID="your-client-id"
