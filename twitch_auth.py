@@ -45,24 +45,28 @@ parser.add_argument(
     action="store_true",
     help="run twitch_reaction_probe.py immediately without printing the tokens",
 )
-parser.add_argument("--channel", help="Twitch streamer ID (prompted when omitted)")
+parser.add_argument(
+    "--channel",
+    default="yaritaiji",
+    help="Twitch streamer ID (default: yaritaiji)",
+)
 parser.add_argument(
     "--duration-minutes",
     type=float,
-    default=None,
-    help="stop after this many minutes; use 0 or omit to run until the stream ends",
+    default=0.0,
+    help="stop after this many minutes; use 0 to run until the stream ends (default: 0)",
 )
 parser.add_argument(
     "--highlight-seconds",
     type=float,
-    default=60.0,
-    help="highlight duration in seconds (default: 60)",
+    default=30.0,
+    help="highlight duration in seconds (default: 30)",
 )
 parser.add_argument(
     "--preroll-seconds",
     type=float,
-    default=3.0,
-    help="seconds to include before the selected utterance (default: 3)",
+    default=5.0,
+    help="seconds to include before the selected utterance (default: 5)",
 )
 parser.add_argument(
     "--utterance-gap-seconds",

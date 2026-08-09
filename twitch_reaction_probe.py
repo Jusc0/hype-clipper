@@ -27,12 +27,12 @@ from faster_whisper.vad import VadOptions, get_speech_timestamps
 
 IRC_HOST = "irc.chat.twitch.tv"
 IRC_PORT = 6697
-HIGHLIGHT_SECONDS = 60.0
+HIGHLIGHT_SECONDS = 30.0
 BUFFER_SAFETY_SECONDS = 30.0
 BUFFER_SEGMENT_SAFETY_SECONDS = 10.0
 ROLLING_BUFFER_SECONDS = HIGHLIGHT_SECONDS + BUFFER_SAFETY_SECONDS
 PREVIOUS_UTTERANCE_LOOKBACK_SECONDS = 20.0
-CLIP_PREROLL_SECONDS = 3.0
+CLIP_PREROLL_SECONDS = 5.0
 TOP_HIGHLIGHT_COUNT = 10
 PREVIEW_INTERVAL_SECONDS = 60.0
 
@@ -1275,7 +1275,11 @@ def generate_live_preview_output(out_dir, channel, candidates, window_seconds,
 
 def main():
     parser = argparse.ArgumentParser(description="Twitch streamer utterance -> chat reaction probe")
-    parser.add_argument("--channel", help="Twitch streamer ID (prompted when omitted)")
+    parser.add_argument(
+        "--channel",
+        default="yaritaiji",
+        help="Twitch streamer ID (default: yaritaiji)",
+    )
     parser.add_argument("--model", help=argparse.SUPPRESS)
     parser.add_argument("--device", help=argparse.SUPPRESS)
     parser.add_argument("--compute-type", help=argparse.SUPPRESS)
@@ -1291,20 +1295,20 @@ def main():
     parser.add_argument(
         "--duration-minutes",
         type=float,
-        default=None,
-        help="stop after this many minutes; use 0 or omit to run until the stream ends",
+        default=0.0,
+        help="stop after this many minutes; use 0 to run until the stream ends (default: 0)",
     )
     parser.add_argument(
         "--highlight-seconds",
         type=float,
         default=HIGHLIGHT_SECONDS,
-        help="highlight duration in seconds (default: 60)",
+        help="highlight duration in seconds (default: 30)",
     )
     parser.add_argument(
         "--preroll-seconds",
         type=float,
         default=CLIP_PREROLL_SECONDS,
-        help="seconds to include before the selected utterance (default: 3)",
+        help="seconds to include before the selected utterance (default: 5)",
     )
     parser.add_argument(
         "--previous-lookback-seconds",

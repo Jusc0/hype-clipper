@@ -55,7 +55,15 @@ PowerShell:
 .\.venv\Scripts\python.exe -u twitch_auth.py --run-probe
 ```
 
-表示された `Twitch配信者ID` に、見たい配信者のIDを入力します。ブラウザでTwitch認証すると収集が始まり、配信終了を検知すると自動終了します。
+引数を省略した場合は、`yaritaiji`を配信終了まで収集し、30秒の切り抜きを発言開始の5秒前から作成します。発言の結合間隔は2.5秒、1つ前の発言を探す範囲は20秒です。
+
+これは次の指定と同じです。
+
+```powershell
+.\.venv\Scripts\python.exe -u twitch_auth.py --run-probe --channel yaritaiji --duration-minutes 0 --highlight-seconds 30 --preroll-seconds 5 --utterance-gap-seconds 2.5 --previous-lookback-seconds 20
+```
+
+ブラウザでTwitch認証すると収集が始まり、配信終了を検知すると自動終了します。
 
 配信者IDをコマンドに直接指定することもできます。
 
@@ -71,7 +79,7 @@ PowerShell:
 .\.venv\Scripts\python.exe -u twitch_auth.py --run-probe --channel indegnasen0706 --duration-minutes 15
 ```
 
-`--duration-minutes 0`を指定した場合も、時間指定を省略した場合と同じく配信終了まで継続します。
+`--duration-minutes 0`を指定した場合も、デフォルトと同じく配信終了まで継続します。
 
 切り抜き時間を変える場合は、秒単位で指定できます。例えば45秒にする場合:
 

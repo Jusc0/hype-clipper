@@ -30,8 +30,8 @@ class WorkerTests(unittest.TestCase):
                 with mock.patch.dict(
                     os.environ,
                     {
-                        "HIGHLIGHT_SECONDS": "60",
-                        "PREROLL_SECONDS": "3",
+                        "HIGHLIGHT_SECONDS": "30",
+                        "PREROLL_SECONDS": "5",
                         "TOP_COUNT": "10",
                     },
                     clear=False,
@@ -39,7 +39,8 @@ class WorkerTests(unittest.TestCase):
                     command = vps_worker.build_probe_command("yaritaiji")
         self.assertIn("--no-preview-server", command)
         self.assertEqual(command[command.index("--channel") + 1], "yaritaiji")
-        self.assertEqual(command[command.index("--highlight-seconds") + 1], "60")
+        self.assertEqual(command[command.index("--highlight-seconds") + 1], "30")
+        self.assertEqual(command[command.index("--preroll-seconds") + 1], "5")
         self.assertEqual(command[command.index("--top-count") + 1], "10")
 
     def test_refresh_rotates_and_saves_refresh_token(self):
