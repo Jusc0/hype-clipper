@@ -150,7 +150,7 @@ python twitch_reaction_probe.py --reaction-start 2 --reaction-end 6
 
 ## VPS版（Docker Compose + Flask + Caddy）
 
-VPS版では、Twitchの収集・VAD・切り抜きをworkerコンテナで行い、Flaskが結果を配信し、CaddyがHTTPSとパスワード保護を担当します。PCとスマホはブラウザーで見るだけです。
+VPS版では、Twitchの収集・VAD・切り抜きをworkerコンテナで行い、Flaskが結果と監視操作画面を配信し、CaddyがHTTPSとパスワード保護を担当します。PCとスマホはブラウザーで見るだけです。最大2配信者を同時監視し、チャット・動画・上位10件ランキングは配信者ごとに完全分離します。
 
 このVPSでは、独自ドメインがなくても次のホスト名を使用できます。`sslip.io`のDNSによって`163.44.122.195`へ解決されます。
 
@@ -181,6 +181,7 @@ HYPE_BASIC_AUTH_HASH='$2a$...'
 TWITCH_CLIENT_ID=...
 TWITCH_CLIENT_SECRET=...
 TWITCH_CHANNEL=yaritaiji
+MAX_CHANNELS=2
 ```
 
 ### 起動
@@ -200,11 +201,9 @@ docker compose logs -f worker
 
 ログに表示されるTwitch認証URLとコードをPCまたはスマホで開きます。認証後のアクセストークンとリフレッシュトークンはDockerボリュームへ保存され、Gitや閲覧用コンテナには渡されません。
 
-配信終了時にworkerは正常停止します。次の配信で再び開始する場合は次を実行します。
+HTTPS画面の入力欄へ配信者IDを入れると、2人まで監視対象を追加できます。配信者タブを押すと、ページを移動せずランキングを直接切り替えられます。ハイライトは「ランキング順」と「新着順」で並べ替えられます。「停止して削除」は対象配信者の保存先だけを消し、ほかの配信者のランキングには影響しません。同じ配信者を収集し直す場合は、停止削除後にIDをもう一度追加します。
 
-```bash
-docker compose start worker
-```
+配信終了後も管理workerは待機するため、別の配信者を画面から追加できます。ハイライト時刻はTwitchの配信開始からの経過時間で表示し、更新時刻とログは日本時間です。
 
 設定やコードを変更した場合は、`start`ではなく次を使用します。
 
@@ -223,4 +222,4 @@ docker compose logs --tail=100 worker
 
 ### 1GB VPS向け設定
 
-`compose.yaml`ではworker 560MB、Flask 112MB、Caddy 96MBのメモリ上限を設定しています。書き起こしは行わず、Gunicornは1 worker・2 threads、FFmpeg変換は既存処理のとおり直列実行です。ホスト側には2GB程度のswapを用意してください。
+`compose.yaml`では最大2配信者を収めるworker全体を700MB、Flask 112MB、Caddy 96MBに制限しています。書き起こしは行わず、Gunicornは1 worker・2 threadsです。複数配信者の720p切り抜き生成は共有ロックで直列化し、同時エンコードによるCPU集中を避けます。ホスト側には2GB程度のswapを用意してください。

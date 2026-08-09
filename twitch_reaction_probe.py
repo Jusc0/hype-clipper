@@ -14,7 +14,8 @@ import sys
 import threading
 import time
 import wave
-from datetime import datetime, timezone
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -37,6 +38,7 @@ PREVIOUS_UTTERANCE_LOOKBACK_SECONDS = 20.0
 CLIP_PREROLL_SECONDS = 5.0
 TOP_HIGHLIGHT_COUNT = 10
 PREVIEW_INTERVAL_SECONDS = 60.0
+JST = timezone(timedelta(hours=9), "JST")
 
 
 def normalize_channel(value):
@@ -53,11 +55,40 @@ def now_ts():
 
 
 def iso(ts):
-    return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone().isoformat(timespec="milliseconds")
+    return datetime.fromtimestamp(ts, tz=JST).isoformat(timespec="milliseconds")
 
 
 def hhmmss(ts):
-    return datetime.fromtimestamp(ts).astimezone().strftime("%H:%M:%S")
+    return datetime.fromtimestamp(ts, tz=JST).strftime("%H:%M:%S")
+
+
+def format_elapsed(seconds):
+    total = max(0, int(round(seconds)))
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+@contextmanager
+def encoding_slot():
+    lock_path = os.environ.get("HYPE_ENCODE_LOCK_FILE", "").strip()
+    if not lock_path:
+        yield
+        return
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+    path = Path(lock_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as lock_file:
+        print("[video] waiting for shared encoder slot", flush=True)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def append_jsonl(path, obj):
@@ -449,7 +480,10 @@ def create_video_highlight(source_path, output_path, start_seconds, duration_sec
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart", str(output_path),
     ]
-    result = subprocess.run(command, capture_output=True, text=True, timeout=180)
+    with encoding_slot():
+        result = subprocess.run(
+            command, capture_output=True, text=True, timeout=180
+        )
     if result.returncode != 0:
         print(f"[video] highlight failed: {result.stderr.strip()}")
         return False
@@ -460,17 +494,18 @@ def create_video_highlight(source_path, output_path, start_seconds, duration_sec
 def create_preview_highlight(source_path, output_path, start_seconds, duration_seconds):
     if not source_path.exists() or source_path.stat().st_size == 0:
         return False
-    result = subprocess.run(
-        [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-ss", f"{start_seconds:.3f}", "-i", str(source_path),
-            "-t", f"{duration_seconds:.3f}",
-            "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
-            "-avoid_negative_ts", "make_zero", "-movflags", "+faststart",
-            str(output_path),
-        ],
-        capture_output=True, text=True, timeout=60,
-    )
+    with encoding_slot():
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-ss", f"{start_seconds:.3f}", "-i", str(source_path),
+                "-t", f"{duration_seconds:.3f}",
+                "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
+                "-avoid_negative_ts", "make_zero", "-movflags", "+faststart",
+                str(output_path),
+            ],
+            capture_output=True, text=True, timeout=60,
+        )
     if result.returncode != 0:
         print(f"[preview] video failed: {result.stderr.strip()}")
         return False
@@ -1013,7 +1048,8 @@ def build_comparison_html(highlights, chats, output, reaction_start, reaction_en
             )
         cards_html = render_cards(item["transcripts"], chats, reaction_start, reaction_end)
         highlight_sections.append(
-            '<section class="highlight">'
+            f'<section class="highlight" data-rank="{rank}" '
+            f'data-start-seconds="{timeline_start:.3f}">'
             f'<h2>{html.escape(item["title"])}</h2>'
             f'{video_html}'
             f'<div class="highlight-meta">収録開始から {item["start"]:.1f}〜{item["start"] + item["duration"]:.1f}秒・{html.escape(item["metric"])}</div>'
@@ -1028,6 +1064,7 @@ def build_comparison_html(highlights, chats, output, reaction_start, reaction_en
 <style>
 body {{ margin:0; font-family:system-ui,-apple-system,"Segoe UI",sans-serif; background:#0e0e10; color:#efeff1; }}
 main {{ width:min(1380px,96vw); margin:32px auto 80px; }}
+.dashboard {{ color:#bf94ff; text-decoration:none; display:inline-block; margin-bottom:12px; }}
 h1 {{ font-size:24px; margin-bottom:6px; }}
 h2 {{ font-size:19px; margin:4px 4px 12px; }}
 .meta {{ color:#adadb8; margin-bottom:26px; }}
@@ -1060,7 +1097,7 @@ def build_html(output, channel, highlights, duration=HIGHLIGHT_SECONDS,
                preroll_seconds=CLIP_PREROLL_SECONDS,
                previous_lookback_seconds=PREVIOUS_UTTERANCE_LOOKBACK_SECONDS,
                display_limit=TOP_HIGHLIGHT_COUNT, video_prefix="highlight_chat",
-               live=False):
+               live=False, timeline_offset_seconds=0.0):
     cards = []
     for rank, item in enumerate(highlights, 1):
         video_name = item.get("video_name", f"{video_prefix}_{rank}.mp4")
@@ -1075,17 +1112,21 @@ def build_html(output, channel, highlights, duration=HIGHLIGHT_SECONDS,
             )
         else:
             video_html = '<div class="waiting">動画候補を準備中です。</div>'
+        timeline_start = max(
+            0.0, item["trigger_start"] + timeline_offset_seconds
+        )
         cards.append(
             '<section class="highlight">'
             f'<h2>{rank}位</h2>'
             f'{video_html}'
-            f'<div class="highlight-meta">収録開始から {item["trigger_start"]:.1f}〜{item["trigger_start"] + duration:.1f}秒・チャット {item["chat_count"]}件</div>'
+            f'<div class="highlight-meta">配信開始から '
+            f'{format_elapsed(timeline_start)}〜'
+            f'{format_elapsed(timeline_start + duration)}・'
+            f'チャット {item["chat_count"]}件</div>'
             '</section>'
         )
     if not cards:
         cards.append('<div class="empty">候補を収集中です。</div>')
-    status = "暫定" if live else "確定"
-    updated_at = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
     update_token = str(time.time_ns())
     live_script = ""
     if live:
@@ -1099,8 +1140,6 @@ async function refreshHighlights() {
     const source = await response.text();
     const next = new DOMParser().parseFromString(source, "text/html");
     if (next.body.dataset.updateToken === currentToken()) return;
-    document.querySelector("h1").textContent = next.querySelector("h1").textContent;
-    document.querySelector(".meta").innerHTML = next.querySelector(".meta").innerHTML;
     document.querySelector(".highlights").innerHTML = next.querySelector(".highlights").innerHTML;
     document.body.dataset.updateToken = next.body.dataset.updateToken;
   } catch (_error) {}
@@ -1117,10 +1156,8 @@ if (location.protocol === "file:") {
 <title>{html.escape(channel)} chat highlight</title>
 <style>
 body {{ margin:0; font-family:system-ui,-apple-system,"Segoe UI",sans-serif; background:#0e0e10; color:#efeff1; }}
-main {{ width:min(1380px,96vw); margin:32px auto 80px; }}
-h1 {{ font-size:24px; margin-bottom:6px; }}
+main {{ width:min(1380px,96vw); margin:16px auto 60px; }}
 h2 {{ font-size:20px; margin:4px 4px 12px; }}
-.meta {{ color:#adadb8; margin-bottom:22px; }}
 .highlights {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:16px; align-items:start; }}
 .highlight {{ background:#18181b; border:1px solid #2f2f35; border-radius:12px; padding:12px; }}
 .highlight video {{ display:block; width:100%; max-height:78vh; background:#000; border-radius:8px; }}
@@ -1128,8 +1165,6 @@ h2 {{ font-size:20px; margin:4px 4px 12px; }}
 .waiting,.empty {{ color:#adadb8; background:#18181b; border:1px solid #2f2f35; border-radius:12px; padding:24px; }}
 @media (max-width:1000px) {{ .highlights {{ grid-template-columns:1fr; }} }}
 </style></head><body data-update-token="{update_token}"><main>
-<h1>{html.escape(channel)} — チャット盛り上がり{status}上位{display_limit}件</h1>
-<div class="meta">重複しない盛り上がり区間を選び、きっかけの1つ前の発言（{previous_lookback_seconds:g}秒以内）の{preroll_seconds:g}秒前から{duration:g}秒を切り抜き。更新: {updated_at}{'（自動更新）' if live else ''}</div>
 <div class="highlights">{''.join(cards)}</div>
 </main>{live_script}</body></html>'''
     temp_path = output.with_suffix(output.suffix + ".tmp")
@@ -1216,7 +1251,7 @@ def generate_comparison_outputs(out_dir, channel, recording_started_at,
 
 def generate_chat_trigger_output(out_dir, channel, candidates, window_seconds,
                                  preroll_seconds, previous_lookback_seconds,
-                                 top_count):
+                                 top_count, timeline_offset_seconds=0.0):
     highlights = candidates[:top_count]
     video_results = []
     for rank, item in enumerate(highlights, 1):
@@ -1227,13 +1262,15 @@ def generate_chat_trigger_output(out_dir, channel, candidates, window_seconds,
     build_html(
         out_dir / "reactions.html", channel, highlights, window_seconds,
         preroll_seconds, previous_lookback_seconds, top_count,
+        timeline_offset_seconds=timeline_offset_seconds,
     )
     return highlights
 
 
 def generate_live_preview_output(out_dir, channel, candidates, window_seconds,
                                  preroll_seconds, previous_lookback_seconds,
-                                 top_count, preview_state):
+                                 top_count, preview_state,
+                                 timeline_offset_seconds=0.0):
     highlights = candidates[:top_count]
     display_highlights = []
     active_keys = set()
@@ -1271,6 +1308,7 @@ def generate_live_preview_output(out_dir, channel, candidates, window_seconds,
         out_dir / "reactions.html", channel, display_highlights, window_seconds,
         preroll_seconds, previous_lookback_seconds, top_count,
         video_prefix="preview_chat", live=True,
+        timeline_offset_seconds=timeline_offset_seconds,
     )
     print(f"[preview] HTML updated: {len(highlights)} candidate(s)")
 
@@ -1335,6 +1373,12 @@ def main():
         action="store_true",
         help="generate preview files without starting the built-in HTTP server",
     )
+    parser.add_argument(
+        "--stream-started-at-epoch",
+        type=float,
+        default=0.0,
+        help="Twitch stream start as Unix seconds for display timestamps",
+    )
     parser.add_argument("--out", default="reaction_session")
     args = parser.parse_args()
 
@@ -1357,6 +1401,8 @@ def main():
         parser.error("--top-count must be greater than 0")
     if args.preview_interval_minutes <= 0:
         parser.error("--preview-interval-minutes must be greater than 0")
+    if args.stream_started_at_epoch < 0:
+        parser.error("--stream-started-at-epoch must be 0 or greater")
 
     if not args.channel:
         try:
@@ -1428,10 +1474,15 @@ def main():
         preview_server = PreviewServer(out_dir)
         preview_server.start()
     preview_state = {}
+    initial_timeline_offset = (
+        max(0.0, now_ts() - args.stream_started_at_epoch)
+        if args.stream_started_at_epoch else 0.0
+    )
     build_html(
         html_path, args.channel, [], args.highlight_seconds,
         args.preroll_seconds, args.previous_lookback_seconds,
         args.top_count, video_prefix="preview_chat", live=True,
+        timeline_offset_seconds=initial_timeline_offset,
     )
 
     stop_event = threading.Event()
@@ -1447,6 +1498,10 @@ def main():
 
     try:
         capture.start()
+        timeline_offset_seconds = (
+            max(0.0, capture.started_at - args.stream_started_at_epoch)
+            if args.stream_started_at_epoch else 0.0
+        )
         if args.duration_minutes is None:
             deadline = None
             recording_seconds = float("inf")
@@ -1503,7 +1558,7 @@ def main():
                     highlight_manager.top_non_overlapping(args.top_count),
                     args.highlight_seconds, args.preroll_seconds,
                     args.previous_lookback_seconds, args.top_count,
-                    preview_state,
+                    preview_state, timeline_offset_seconds,
                 )
                 next_preview_update = (
                     time.monotonic() + args.preview_interval_minutes * 60
@@ -1533,7 +1588,7 @@ def main():
             generate_chat_trigger_output(
                 out_dir, args.channel, highlights, args.highlight_seconds,
                 args.preroll_seconds, args.previous_lookback_seconds,
-                args.top_count,
+                args.top_count, timeline_offset_seconds,
             )
             completed = sum(path.exists() for path in ranked_highlight_paths)
             if completed >= len(highlights):

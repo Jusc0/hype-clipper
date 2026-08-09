@@ -18,9 +18,9 @@ RUN pip install --no-cache-dir -r requirements-vps.txt
 
 COPY twitch_reaction_probe.py vps_worker.py hype_web.py ./
 
-RUN mkdir -p /data /auth /models/huggingface \
-    && touch /data/.keep /auth/.keep /models/huggingface/.keep \
-    && chown -R hype:hype /app /data /auth /models
+RUN mkdir -p /data /auth /control /models/huggingface \
+    && touch /data/.keep /auth/.keep /control/.keep /models/huggingface/.keep \
+    && chown -R hype:hype /app /data /auth /control /models
 
 USER hype
 

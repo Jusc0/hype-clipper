@@ -5,6 +5,8 @@ services:
     command: ["python", "-u", "vps_worker.py"]
     environment:
       HYPE_DATA_DIR: /data
+      HYPE_CONTROL_DIR: /control
+      HYPE_ENCODE_LOCK_FILE: /control/encode.lock
       TWITCH_TOKEN_FILE: /auth/twitch_tokens.json
       TWITCH_CLIENT_ID: ${TWITCH_CLIENT_ID}
       TWITCH_CLIENT_SECRET: ${TWITCH_CLIENT_SECRET:-}
@@ -17,17 +19,20 @@ services:
       TOP_COUNT: ${TOP_COUNT:-10}
       PREVIEW_INTERVAL_MINUTES: ${PREVIEW_INTERVAL_MINUTES:-1}
       SEGMENT_SECONDS: ${SEGMENT_SECONDS:-8}
+      MAX_CHANNELS: ${MAX_CHANNELS:-2}
+      TZ: Asia/Tokyo
     volumes:
       - hype_data:/data
       - hype_auth:/auth
+      - hype_control:/control
       - model_cache:/models
     init: true
-    restart: "on-failure:5"
+    restart: unless-stopped
     stop_grace_period: 5m
-    mem_limit: 560m
-    memswap_limit: 1200m
-    cpus: 1.50
-    pids_limit: 256
+    mem_limit: 700m
+    memswap_limit: 1600m
+    cpus: 1.75
+    pids_limit: 384
     logging: &rotated-logs
       driver: json-file
       options:
@@ -48,8 +53,12 @@ services:
       - hype_web:app
     environment:
       HYPE_DATA_DIR: /data
+      HYPE_CONTROL_DIR: /control
+      MAX_CHANNELS: ${MAX_CHANNELS:-2}
+      TZ: Asia/Tokyo
     volumes:
       - hype_data:/data:ro
+      - hype_control:/control
     expose:
       - "8000"
     init: true
@@ -79,6 +88,7 @@ services:
       HYPE_DOMAIN: ${HYPE_DOMAIN}
       HYPE_BASIC_AUTH_USER: ${HYPE_BASIC_AUTH_USER}
       HYPE_BASIC_AUTH_HASH: ${HYPE_BASIC_AUTH_HASH}
+      TZ: Asia/Tokyo
     ports:
       - "80:80"
       - "443:443"
@@ -100,6 +110,7 @@ services:
 volumes:
   hype_data:
   hype_auth:
+  hype_control:
   model_cache:
   caddy_data:
   caddy_config:

@@ -9,6 +9,8 @@ import sys
 import threading
 import urllib.parse
 import webbrowser
+from datetime import datetime
+
 import requests
 import secrets
 
@@ -184,6 +186,29 @@ def get_access_token(code):
     return response.json()
 
 
+def get_stream_started_at_epoch(channel, access_token):
+    try:
+        response = requests.get(
+            "https://api.twitch.tv/helix/streams",
+            params={"user_login": channel},
+            headers={
+                "Client-Id": CLIENT_ID,
+                "Authorization": f"Bearer {access_token}",
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        streams = response.json().get("data", [])
+        if not streams:
+            return 0.0
+        return datetime.fromisoformat(
+            streams[0]["started_at"].replace("Z", "+00:00")
+        ).timestamp()
+    except (requests.RequestException, KeyError, TypeError, ValueError) as exc:
+        print(f"[stream] 配信開始時刻を取得できませんでした: {exc}")
+        return 0.0
+
+
 scope_string = " ".join(SCOPES)
 
 params = {
@@ -236,6 +261,9 @@ if args.run_probe:
     env = os.environ.copy()
     env["TWITCH_NICK"] = validation.json()["login"]
     env["TWITCH_OAUTH_TOKEN"] = access_token
+    stream_started_at_epoch = get_stream_started_at_epoch(
+        args.channel, access_token
+    )
     probe = Path(__file__).with_name("twitch_reaction_probe.py")
     if args.duration_minutes is None:
         print(f"\n認証完了。{args.channel} を配信終了まで収集します。\n")
@@ -259,6 +287,8 @@ if args.run_probe:
         str(args.top_count),
         "--preview-interval-minutes",
         str(args.preview_interval_minutes),
+        "--stream-started-at-epoch",
+        str(stream_started_at_epoch),
     ]
     if args.duration_minutes is not None:
         command.extend(["--duration-minutes", str(args.duration_minutes)])
