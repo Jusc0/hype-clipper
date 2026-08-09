@@ -105,6 +105,70 @@ class JsonlTail:
 
 
 class QuietPreviewHandler(http.server.SimpleHTTPRequestHandler):
+    def send_head(self):
+        self._byte_range = None
+        path = self.translate_path(self.path)
+        if os.path.isdir(path):
+            return super().send_head()
+        try:
+            source = open(path, "rb")
+        except OSError:
+            self.send_error(404, "File not found")
+            return None
+
+        stat = os.fstat(source.fileno())
+        content_type = self.guess_type(path)
+        range_header = self.headers.get("Range", "")
+        match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
+        if match:
+            first, last = match.groups()
+            if not first and not last:
+                source.close()
+                self.send_error(416, "Invalid range")
+                return None
+            if first:
+                start = int(first)
+                end = int(last) if last else stat.st_size - 1
+            else:
+                length = int(last)
+                start = max(0, stat.st_size - length)
+                end = stat.st_size - 1
+            if start >= stat.st_size or start > end:
+                source.close()
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{stat.st_size}")
+                self.end_headers()
+                return None
+            end = min(end, stat.st_size - 1)
+            self._byte_range = (start, end)
+            source.seek(start)
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{end}/{stat.st_size}")
+            content_length = end - start + 1
+        else:
+            self.send_response(200)
+            content_length = stat.st_size
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(content_length))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Last-Modified", self.date_time_string(stat.st_mtime))
+        if path.lower().endswith((".html", ".json")):
+            self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        return source
+
+    def copyfile(self, source, outputfile):
+        if self._byte_range is None:
+            return super().copyfile(source, outputfile)
+        start, end = self._byte_range
+        remaining = end - start + 1
+        while remaining > 0:
+            chunk = source.read(min(256 * 1024, remaining))
+            if not chunk:
+                break
+            outputfile.write(chunk)
+            remaining -= len(chunk)
+
     def log_message(self, _format, *_args):
         pass
 
