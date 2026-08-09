@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+reaction_session/
+
+.env
+.env.*
+!.env.example
+
+*.log
+.DS_Store
+Thumbs.db
