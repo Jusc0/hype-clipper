@@ -24,11 +24,14 @@ services:
       VOD_FINALIZE_MINUTES: ${VOD_FINALIZE_MINUTES:-15}
       MAX_CHANNELS: ${MAX_CHANNELS:-3}
       TZ: Asia/Tokyo
+      YOUTUBE_CLIENT_SECRETS_FILE: /youtube-auth/client_secret.json
+      YOUTUBE_TOKEN_FILE: /youtube-auth/token.pickle
     volumes:
       - hype_data:/data
       - hype_auth:/auth
       - hype_control:/control
       - model_cache:/models
+      - /root/record/data:/youtube-auth:ro
     init: true
     restart: unless-stopped
     stop_grace_period: 5m

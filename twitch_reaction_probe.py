@@ -1503,6 +1503,9 @@ def main():
             max(0.0, capture.started_at - args.stream_started_at_epoch)
             if args.stream_started_at_epoch else 0.0
         )
+        print(f"[DEBUG OFFSET] capture.started_at={capture.started_at}")
+        print(f"[DEBUG OFFSET] stream_started_at_epoch={args.stream_started_at_epoch}")
+        print(f"[DEBUG OFFSET] timeline_offset_seconds={timeline_offset_seconds}")
         if args.duration_minutes is None:
             deadline = None
             recording_seconds = float("inf")

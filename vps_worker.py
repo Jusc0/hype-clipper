@@ -452,6 +452,33 @@ def stop_process(child: subprocess.Popen, timeout: float = 15.0) -> None:
         except subprocess.TimeoutExpired:
             pass
 
+def start_youtube_publish(
+    channel: str,
+    session_dir: Path,
+    env: dict,
+) -> subprocess.Popen:
+    command = [
+        sys.executable,
+        "-u",
+        str(Path(__file__).with_name("youtube_publish.py")),
+        "--channel",
+        channel,
+        "--session-dir",
+        str(session_dir),
+        "--limit",
+        os.environ.get("TOP_COUNT", "10"),
+    ]
+
+    print(
+        f"[publish] starting YouTube publish for #{channel}",
+        flush=True,
+    )
+
+    return subprocess.Popen(
+        command,
+        env=env,
+        start_new_session=True,
+    )
 
 def main() -> int:
     client_id = os.environ.get("TWITCH_CLIENT_ID", "").strip()
@@ -470,6 +497,7 @@ def main() -> int:
     child_env["TWITCH_NICK"] = nick
     child_env["TWITCH_OAUTH_TOKEN"] = access_token
     active: dict[str, dict] = {}
+    publishing: dict[str, dict] = {}
     completed: dict[str, str] = {}
     cold_start_requests = load_desired_channels(default_channel)
     shutdown_requested = False
@@ -507,6 +535,10 @@ def main() -> int:
         for channel, request_id in list(completed.items()):
             if desired.get(channel) == request_id:
                 continue
+
+            if channel in publishing:
+                continue
+
             completed.pop(channel, None)
             purge_channel_data(channel)
 
@@ -555,20 +587,101 @@ def main() -> int:
 
         for channel, running in list(active.items()):
             return_code = running["process"].poll()
+
             if return_code is None:
                 continue
-            active.pop(channel, None)
-            completed[channel] = running["request_id"]
-            state = "stopped" if return_code == 0 else "error"
-            write_channel_status(channel, state, exit_code=return_code)
-            print(
-                f"[control] #{channel} {state} ({return_code})",
-                flush=True,
-            )
 
+            active.pop(channel, None)
+
+            request_id = running["request_id"]
+
+            if return_code == 0:
+                try:
+                    publish_process = start_youtube_publish(
+                        channel,
+                        channel_data_dir(channel),
+                        child_env,
+                    )
+
+                    publishing[channel] = {
+                        "request_id": request_id,
+                        "process": publish_process,
+                    }
+
+                    write_channel_status(
+                        channel,
+                        "publishing",
+                        exit_code=return_code,
+                        publish_pid=publish_process.pid,
+                    )
+
+                except Exception as exc:
+                    completed[channel] = request_id
+
+                    write_channel_status(
+                        channel,
+                        "publish_error",
+                        exit_code=return_code,
+                        message=str(exc),
+                    )
+
+                    print(
+                        f"[publish] #{channel} could not start: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
+            else:
+                completed[channel] = request_id
+
+                write_channel_status(
+                    channel,
+                    "error",
+                    exit_code=return_code,
+                )
+
+                print(
+                    f"[control] #{channel} error ({return_code})",
+                    flush=True,
+                )
+        for channel, job in list(publishing.items()):
+            return_code = job["process"].poll()
+
+            if return_code is None:
+                continue
+
+            publishing.pop(channel, None)
+            completed[channel] = job["request_id"]
+
+            if return_code == 0:
+                write_channel_status(
+                    channel,
+                    "published",
+                    publish_exit_code=return_code,
+                )
+
+                print(
+                    f"[publish] #{channel} YouTube publish completed",
+                    flush=True,
+                )
+
+            else:
+                write_channel_status(
+                    channel,
+                    "publish_error",
+                    publish_exit_code=return_code,
+                )
+
+                print(
+                    f"[publish] #{channel} YouTube publish failed "
+                    f"({return_code})",
+                    file=sys.stderr,
+                    flush=True,
+                )
         write_status(
             "running",
             active_channels=sorted(active),
+            publishing_channels=sorted(publishing),
             configured_channels=sorted(desired),
             max_channels=MAX_CHANNELS,
         )

@@ -1,3 +1,6 @@
 -r requirements.txt
 Flask>=3.1,<4
 gunicorn>=23,<24
+google-api-python-client
+google-auth
+google-auth-oauthlib

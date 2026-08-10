@@ -13,3 +13,8 @@ config.local.json
 *.log
 .DS_Store
 Thumbs.db
+control/
+data/
+twitch_tokens.json
+token.pickle
+client_secret.json
