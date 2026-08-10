@@ -136,19 +136,27 @@ def create_app(
         channel = entry["channel"]
         directory = channel_dir(channel)
         page = directory / "reactions.html"
+        manifest = directory / "highlights.json"
         try:
             content_updated_at = datetime.fromtimestamp(
                 page.stat().st_mtime, tz=JST
             ).isoformat(timespec="seconds")
         except OSError:
             content_updated_at = None
-        highlight_count = sum(
-            1 for path in directory.glob("preview_*.mp4") if path.is_file()
-        )
-        if not highlight_count:
+        try:
+            ranking_payload = json.loads(manifest.read_text(encoding="utf-8"))
+            highlight_count = len(ranking_payload.get("highlights", []))
+        except (OSError, json.JSONDecodeError, TypeError):
+            highlight_count = None
+        if highlight_count is None:
             highlight_count = sum(
-                1 for path in directory.glob("highlight_chat_*.mp4") if path.is_file()
+                1 for path in directory.glob("preview_*.mp4") if path.is_file()
             )
+            if not highlight_count:
+                highlight_count = sum(
+                    1 for path in directory.glob("highlight_chat_*.mp4")
+                    if path.is_file()
+                )
         return {
             "channel": channel,
             "added_at": entry.get("added_at"),

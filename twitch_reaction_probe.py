@@ -26,9 +26,11 @@ os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
 from faster_whisper.vad import VadOptions, get_speech_timestamps
 
+from vod_clip_manager import VodClipManager, candidate_id as make_candidate_id
+
 IRC_HOST = "irc.chat.twitch.tv"
 IRC_PORT = 6697
-STREAM_QUALITY = "720p,720p60,best"
+LIVE_AUDIO_QUALITY = "audio_only"
 OUTPUT_VIDEO_HEIGHT = 720
 HIGHLIGHT_SECONDS = 30.0
 BUFFER_SAFETY_SECONDS = 30.0
@@ -512,20 +514,23 @@ def create_preview_highlight(source_path, output_path, start_seconds, duration_s
     return True
 
 
-class RollingHighlightManager:
-    def __init__(self, segment_dir, candidate_dir, chat_path, transcript_path,
-                 recording_started_at, segment_seconds, recording_seconds,
+class RealtimeHighlightManager:
+    """Keep the existing VAD/chat ranking logic, but store offsets, not video."""
+
+    def __init__(self, chat_path, transcript_path, recording_started_at,
+                 segment_seconds, recording_seconds,
+                 timeline_offset_seconds=0.0, stream_id="",
                  highlight_seconds=HIGHLIGHT_SECONDS,
                  preroll_seconds=CLIP_PREROLL_SECONDS,
                  previous_lookback_seconds=PREVIOUS_UTTERANCE_LOOKBACK_SECONDS,
                  buffer_seconds=ROLLING_BUFFER_SECONDS, candidate_limit=8):
-        self.segment_dir = segment_dir
-        self.candidate_dir = candidate_dir
         self.chat_path = chat_path
         self.transcript_path = transcript_path
         self.recording_started_at = recording_started_at
         self.segment_seconds = segment_seconds
         self.recording_seconds = recording_seconds
+        self.timeline_offset_seconds = timeline_offset_seconds
+        self.stream_id = stream_id
         self.highlight_seconds = highlight_seconds
         self.preroll_seconds = preroll_seconds
         self.previous_lookback_seconds = previous_lookback_seconds
@@ -533,12 +538,10 @@ class RollingHighlightManager:
         self.candidate_limit = candidate_limit
         self.candidates = []
         self.last_window_end = None
-        self.next_candidate_id = 0
         self.chat_tail = JsonlTail(chat_path)
         self.speech_tail = JsonlTail(transcript_path)
         self.chats = []
         self.speech_segments = []
-        self.candidate_dir.mkdir(parents=True, exist_ok=True)
 
     def _refresh_events(self, current_offset):
         self.chats.extend(self.chat_tail.read_new())
@@ -551,70 +554,14 @@ class RollingHighlightManager:
             if media_interval(row, self.segment_seconds)[1] >= keep_after
         ]
 
-    def _preserve_window(self, trigger_start):
-        start_ts = self.recording_started_at + trigger_start
-        end_ts = start_ts + self.highlight_seconds
-        segments = []
-        for path in sorted(self.segment_dir.glob("segment_*.ts")):
-            created = path.stat().st_ctime
-            if created <= end_ts + 6 and created + 7 >= start_ts:
-                segments.append(path)
-        if not segments:
-            return None, 0.0
-
-        candidate_id = self.next_candidate_id
-        self.next_candidate_id += 1
-        list_path = self.candidate_dir / f"candidate_{candidate_id:04d}.txt"
-        output_path = self.candidate_dir / f"candidate_{candidate_id:04d}.ts"
-        lines = []
-        for path in segments:
-            safe_path = path.resolve().as_posix().replace("'", "'\\''")
-            lines.append(f"file '{safe_path}'")
-        list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        result = subprocess.run(
-            [
-                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                "-f", "concat", "-safe", "0", "-i", str(list_path),
-                "-c", "copy", "-f", "mpegts", str(output_path),
-            ],
-            capture_output=True, text=True, timeout=60,
-        )
-        try:
-            list_path.unlink()
-        except OSError:
-            pass
-        if result.returncode != 0 or not output_path.exists():
-            print(f"[buffer] candidate copy failed: {result.stderr.strip()}")
-            return None, 0.0
-        source_offset = max(0.0, start_ts - segments[0].stat().st_ctime)
-        return output_path, source_offset
-
-    def _delete_candidate(self, item):
-        try:
-            item["source_path"].unlink()
-        except OSError:
-            pass
-
-    def _prune_segments(self, current_offset):
-        cutoff = self.recording_started_at + current_offset - self.buffer_seconds
-        segments = sorted(self.segment_dir.glob("segment_*.ts"))
-        for path in segments[:-2]:
-            if path.stat().st_ctime < cutoff:
-                try:
-                    path.unlink()
-                except OSError:
-                    pass
-
     def evaluate(self, current_offset, force=False):
         safe_end = current_offset if force else current_offset - 5.0
         if safe_end < self.highlight_seconds:
-            self._prune_segments(current_offset)
-            return
+            return False
         window_end = safe_end if force else math.floor(safe_end / 5.0) * 5.0
         window_end = min(window_end, self.recording_seconds)
         if self.last_window_end is not None and window_end <= self.last_window_end:
-            self._prune_segments(current_offset)
-            return
+            return False
         self.last_window_end = window_end
         peak_start = max(0.0, window_end - self.highlight_seconds)
 
@@ -640,34 +587,32 @@ class RollingHighlightManager:
             None,
         )
         if nearby and chat_count <= nearby["chat_count"]:
-            self._prune_segments(current_offset)
-            return
+            return False
         if (not nearby and len(self.candidates) >= self.candidate_limit
                 and chat_count <= min(item["chat_count"] for item in self.candidates)):
-            self._prune_segments(current_offset)
-            return
-
-        source_path, source_offset = self._preserve_window(trigger_start)
-        if source_path is None:
-            self._prune_segments(current_offset)
-            return
+            return False
+        offset_seconds = max(
+            0.0, trigger_start + self.timeline_offset_seconds
+        )
         item = {
+            "candidate_id": make_candidate_id(self.stream_id, offset_seconds),
             "trigger_start": trigger_start,
+            "offset_seconds": offset_seconds,
             "trigger_text": trigger_row.get("text", "") if trigger_row else "",
             "chat_count": chat_count,
-            "source_path": source_path,
-            "source_offset": source_offset,
+            "score": chat_count,
         }
         if nearby:
-            self._delete_candidate(nearby)
             self.candidates.remove(nearby)
         self.candidates.append(item)
         while len(self.candidates) > self.candidate_limit:
             loser = min(self.candidates, key=lambda row: row["chat_count"])
-            self._delete_candidate(loser)
             self.candidates.remove(loser)
-        print(f"[buffer] candidate: {trigger_start:.1f}s / {chat_count} chats")
-        self._prune_segments(current_offset)
+        print(
+            f"[ranking] candidate: stream+{offset_seconds:.1f}s / "
+            f"{chat_count} chats"
+        )
+        return True
 
     def top_non_overlapping(self, limit=TOP_HIGHLIGHT_COUNT):
         selected = []
@@ -781,11 +726,33 @@ class TwitchChatRecorder(threading.Thread):
                 pass
 
 
-class AudioCapture:
-    def __init__(self, channel_url, chunk_dir, video_segment_dir, segment_seconds):
+def build_live_audio_streamlink_command(channel_url):
+    return [
+        "streamlink",
+        "--ringbuffer-size",
+        "4M",
+        "--stdout",
+        channel_url,
+        LIVE_AUDIO_QUALITY,
+    ]
+
+
+def build_live_audio_ffmpeg_command(chunk_dir, segment_seconds):
+    return [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning",
+        "-i", "pipe:0",
+        "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000",
+        "-c:a", "pcm_s16le", "-f", "segment",
+        "-segment_time", str(segment_seconds),
+        "-reset_timestamps", "1",
+        str(chunk_dir / "chunk_%06d.wav"),
+    ]
+
+
+class AudioOnlyCapture:
+    def __init__(self, channel_url, chunk_dir, segment_seconds):
         self.channel_url = channel_url
         self.chunk_dir = chunk_dir
-        self.video_segment_dir = video_segment_dir
         self.segment_seconds = segment_seconds
         self.streamlink = None
         self.ffmpeg = None
@@ -798,28 +765,16 @@ class AudioCapture:
             raise RuntimeError("ffmpeg が PATH にありません。")
 
         self.chunk_dir.mkdir(parents=True, exist_ok=True)
-        self.video_segment_dir.mkdir(parents=True, exist_ok=True)
         self.streamlink = subprocess.Popen(
-            ["streamlink", "--stdout", self.channel_url, STREAM_QUALITY],
+            build_live_audio_streamlink_command(self.channel_url),
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             bufsize=0,
         )
         self.ffmpeg = subprocess.Popen(
-            [
-                "ffmpeg", "-hide_banner", "-loglevel", "warning",
-                "-i", "pipe:0",
-                "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000",
-                "-c:a", "pcm_s16le", "-f", "segment",
-                "-segment_time", str(self.segment_seconds),
-                "-reset_timestamps", "1",
-                str(self.chunk_dir / "chunk_%06d.wav"),
-                "-map", "0:v:0?", "-map", "0:a:0?",
-                "-c", "copy", "-f", "segment",
-                "-segment_time", "5", "-reset_timestamps", "1",
-                "-segment_format", "mpegts",
-                str(self.video_segment_dir / "segment_%06d.ts"),
-            ],
+            build_live_audio_ffmpeg_command(
+                self.chunk_dir, self.segment_seconds
+            ),
             stdin=self.streamlink.stdout,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
@@ -833,10 +788,10 @@ class AudioCapture:
                 error = self.ffmpeg.stderr.read().strip() if self.ffmpeg.stderr else ""
                 raise RuntimeError(f"ffmpeg failed to start capture: {error}")
             if time.monotonic() >= ready_deadline:
-                raise RuntimeError("配信映像の受信開始を30秒待ちましたが、データが届きませんでした。")
+                raise RuntimeError("audio_onlyの受信開始を30秒待ちましたが、データが届きませんでした。")
             time.sleep(0.1)
         self.started_at = first_chunk.stat().st_ctime
-        print("[media] video/audio capture started")
+        print("[media] audio_only capture started")
 
     def stop(self):
         # Stop the source first. Its closed pipe lets ffmpeg finish and write a
@@ -1103,7 +1058,8 @@ def build_html(output, channel, highlights, duration=HIGHLIGHT_SECONDS,
         video_name = item.get("video_name", f"{video_prefix}_{rank}.mp4")
         video_html = ""
         video_path = output.parent / video_name
-        if video_path.exists():
+        video_status = item.get("video_status", "ready" if video_path.exists() else "waiting_vod")
+        if video_status == "ready" and video_path.exists():
             version = video_path.stat().st_mtime_ns
             video_html = (
                 f'<video controls preload="metadata" playsinline '
@@ -1111,12 +1067,21 @@ def build_html(output, channel, highlights, duration=HIGHLIGHT_SECONDS,
                 '映像を再生できません。</video>'
             )
         else:
-            video_html = '<div class="waiting">動画候補を準備中です。</div>'
-        timeline_start = max(
-            0.0, item["trigger_start"] + timeline_offset_seconds
-        )
+            status_text = {
+                "waiting_vod": "VODへの反映を待っています。",
+                "generating": "VODから動画を生成中です。",
+                "unavailable": "この配信のVODは利用できません。",
+                "failed": "動画生成に失敗しました。再試行します。",
+            }.get(video_status, "動画候補を準備中です。")
+            video_html = f'<div class="waiting">{status_text}</div>'
+        timeline_start = max(0.0, float(item.get(
+            "offset_seconds",
+            item["trigger_start"] + timeline_offset_seconds,
+        )))
         cards.append(
-            '<section class="highlight">'
+            f'<section class="highlight" data-rank="{rank}" '
+            f'data-start-seconds="{timeline_start:.3f}" '
+            f'data-video-status="{html.escape(video_status)}">'
             f'<h2>{rank}位</h2>'
             f'{video_html}'
             f'<div class="highlight-meta">配信開始から '
@@ -1379,6 +1344,27 @@ def main():
         default=0.0,
         help="Twitch stream start as Unix seconds for display timestamps",
     )
+    parser.add_argument("--stream-id", default="")
+    parser.add_argument("--stream-user-id", default="")
+    parser.add_argument("--stream-started-at", default="")
+    parser.add_argument(
+        "--vod-poll-seconds",
+        type=float,
+        default=60.0,
+        help="seconds between Twitch VOD availability checks (default: 60)",
+    )
+    parser.add_argument(
+        "--vod-ready-margin-seconds",
+        type=float,
+        default=10.0,
+        help="extra published VOD duration required after each clip (default: 10)",
+    )
+    parser.add_argument(
+        "--vod-finalize-minutes",
+        type=float,
+        default=15.0,
+        help="VOD retry time after a natural stream end (default: 15)",
+    )
     parser.add_argument(
         "--preserve-published-on-start",
         action="store_true",
@@ -1408,6 +1394,12 @@ def main():
         parser.error("--preview-interval-minutes must be greater than 0")
     if args.stream_started_at_epoch < 0:
         parser.error("--stream-started-at-epoch must be 0 or greater")
+    if args.vod_poll_seconds < 30:
+        parser.error("--vod-poll-seconds must be at least 30")
+    if args.vod_ready_margin_seconds < 0:
+        parser.error("--vod-ready-margin-seconds must be 0 or greater")
+    if args.vod_finalize_minutes < 0:
+        parser.error("--vod-finalize-minutes must be 0 or greater")
 
     if not args.channel:
         try:
@@ -1434,20 +1426,13 @@ def main():
     transcript_path = out_dir / "transcript.jsonl"
     detailed_transcript_path = out_dir / "transcript.detailed.jsonl"
     html_path = out_dir / "reactions.html"
+    manifest_path = out_dir / "highlights.json"
     legacy_media_path = out_dir / "capture.ts"
     video_segment_dir = out_dir / "video_buffer"
     candidate_dir = out_dir / "candidate_buffer"
     legacy_highlight_path = out_dir / "highlight.mp4"
     speech_highlight_path = out_dir / "highlight_speech.mp4"
     chat_highlight_path = out_dir / "highlight_chat.mp4"
-    ranked_highlight_paths = [
-        out_dir / f"highlight_chat_{rank}.mp4"
-        for rank in range(1, args.top_count + 1)
-    ]
-    preview_highlight_paths = [
-        out_dir / f"preview_chat_{rank}.mp4"
-        for rank in range(1, args.top_count + 1)
-    ]
     speech_transcript_path = out_dir / "highlight_speech_transcript.jsonl"
     chat_transcript_path = out_dir / "highlight_chat_transcript.jsonl"
     clip_dir = out_dir / "utterance_clips"
@@ -1461,9 +1446,7 @@ def main():
         legacy_recording_path,
     ]
     if not args.preserve_published_on_start:
-        reset_paths.extend([
-            html_path, *ranked_highlight_paths, *preview_highlight_paths,
-        ])
+        reset_paths.extend([html_path, manifest_path])
     for p in reset_paths:
         if p.exists():
             p.unlink()
@@ -1484,28 +1467,32 @@ def main():
     if not args.no_preview_server:
         preview_server = PreviewServer(out_dir)
         preview_server.start()
-    preview_state = {}
     initial_timeline_offset = (
         max(0.0, now_ts() - args.stream_started_at_epoch)
         if args.stream_started_at_epoch else 0.0
     )
-    build_html(
-        html_path, args.channel, [], args.highlight_seconds,
-        args.preroll_seconds, args.previous_lookback_seconds,
-        args.top_count, video_prefix="preview_chat", live=True,
-        timeline_offset_seconds=initial_timeline_offset,
-    )
+    if not (args.preserve_published_on_start and html_path.is_file()):
+        build_html(
+            html_path, args.channel, [], args.highlight_seconds,
+            args.preroll_seconds, args.previous_lookback_seconds,
+            args.top_count, video_prefix="preview_vod", live=True,
+            timeline_offset_seconds=initial_timeline_offset,
+        )
 
     stop_event = threading.Event()
     chat = TwitchChatRecorder(args.channel, nick, token, chat_path, stop_event)
     chat.start()
 
-    capture = AudioCapture(
-        f"https://www.twitch.tv/{args.channel}", chunk_dir,
-        video_segment_dir, args.segment_seconds
+    capture = AudioOnlyCapture(
+        f"https://www.twitch.tv/{args.channel}",
+        chunk_dir,
+        args.segment_seconds,
     )
     speech_detector = None
     highlight_manager = None
+    vod_manager = None
+    render_rankings = None
+    stream_ended = False
 
     try:
         capture.start()
@@ -1524,15 +1511,53 @@ def main():
             args.previous_lookback_seconds + args.preroll_seconds
             + BUFFER_SEGMENT_SAFETY_SECONDS,
         )
-        highlight_manager = RollingHighlightManager(
-            video_segment_dir, candidate_dir, chat_path, speech_path,
-            capture.started_at, args.segment_seconds, recording_seconds,
+        highlight_manager = RealtimeHighlightManager(
+            chat_path, speech_path, capture.started_at,
+            args.segment_seconds, recording_seconds,
+            timeline_offset_seconds=timeline_offset_seconds,
+            stream_id=args.stream_id,
             highlight_seconds=args.highlight_seconds,
             preroll_seconds=args.preroll_seconds,
             previous_lookback_seconds=args.previous_lookback_seconds,
             buffer_seconds=buffer_seconds,
             candidate_limit=max(30, args.top_count * 3),
         )
+        stream_started_at = args.stream_started_at
+        if not stream_started_at and args.stream_started_at_epoch:
+            stream_started_at = datetime.fromtimestamp(
+                args.stream_started_at_epoch, tz=timezone.utc
+            ).isoformat().replace("+00:00", "Z")
+        vod_manager = VodClipManager(
+            out_dir,
+            args.channel,
+            args.stream_id,
+            args.stream_user_id,
+            stream_started_at,
+            os.environ.get("TWITCH_CLIENT_ID", "").strip(),
+            token,
+            args.highlight_seconds,
+            poll_seconds=args.vod_poll_seconds,
+            ready_margin_seconds=args.vod_ready_margin_seconds,
+        )
+        render_lock = threading.Lock()
+
+        def render_rankings():
+            with render_lock:
+                build_html(
+                    html_path,
+                    args.channel,
+                    vod_manager.rankings(),
+                    args.highlight_seconds,
+                    args.preroll_seconds,
+                    args.previous_lookback_seconds,
+                    args.top_count,
+                    video_prefix="preview_vod",
+                    live=True,
+                    timeline_offset_seconds=timeline_offset_seconds,
+                )
+
+        vod_manager.on_change = render_rankings
+        vod_manager.start()
         speech_detector = SpeechDetector(
             chunk_dir, speech_path, capture.started_at, args.segment_seconds,
             args.utterance_gap_seconds, stop_event
@@ -1549,28 +1574,33 @@ def main():
             print(f"phone preview: {preview_server.phone_url}\n")
         else:
             print("preview files: external web service\n")
-        next_buffer_check = time.monotonic()
+        next_ranking_check = time.monotonic()
         next_preview_update = time.monotonic() + args.preview_interval_minutes * 60
         while not stop_event.is_set():
             if ((capture.streamlink and capture.streamlink.poll() is not None)
                     or (capture.ffmpeg and capture.ffmpeg.poll() is not None)):
                 print("\n[main] stream ended or disconnected; stopping...")
+                stream_ended = True
                 break
             remaining = None if deadline is None else deadline - time.monotonic()
             if remaining is not None and remaining <= 0:
                 print("\n[main] recording duration reached; stopping...")
                 break
-            if time.monotonic() >= next_buffer_check:
-                highlight_manager.evaluate(now_ts() - capture.started_at)
-                next_buffer_check = time.monotonic() + 1.0
-            if time.monotonic() >= next_preview_update:
-                generate_live_preview_output(
-                    out_dir, args.channel,
-                    highlight_manager.top_non_overlapping(args.top_count),
-                    args.highlight_seconds, args.preroll_seconds,
-                    args.previous_lookback_seconds, args.top_count,
-                    preview_state, timeline_offset_seconds,
+            if time.monotonic() >= next_ranking_check:
+                changed = highlight_manager.evaluate(
+                    now_ts() - capture.started_at
                 )
+                if changed:
+                    vod_manager.sync(
+                        highlight_manager.top_non_overlapping(args.top_count)
+                    )
+                    render_rankings()
+                next_ranking_check = time.monotonic() + 1.0
+            if time.monotonic() >= next_preview_update:
+                vod_manager.sync(
+                    highlight_manager.top_non_overlapping(args.top_count)
+                )
+                render_rankings()
                 next_preview_update = (
                     time.monotonic() + args.preview_interval_minutes * 60
                 )
@@ -1592,26 +1622,41 @@ def main():
             final_offset = now_ts() - capture.started_at
             if args.duration_minutes is not None:
                 final_offset = min(args.duration_minutes * 60, final_offset)
-            highlight_manager.evaluate(
-                final_offset, force=True,
-            )
+            highlight_manager.evaluate(final_offset, force=True)
             highlights = highlight_manager.top_non_overlapping(args.top_count)
-            generate_chat_trigger_output(
-                out_dir, args.channel, highlights, args.highlight_seconds,
-                args.preroll_seconds, args.previous_lookback_seconds,
-                args.top_count, timeline_offset_seconds,
-            )
-            completed = sum(path.exists() for path in ranked_highlight_paths)
-            if completed >= len(highlights):
-                if video_segment_dir.exists():
-                    shutil.rmtree(video_segment_dir)
-                if candidate_dir.exists():
-                    shutil.rmtree(candidate_dir)
+        if vod_manager:
+            vod_manager.sync(highlights)
+            if render_rankings:
+                render_rankings()
+            if stream_ended and args.vod_finalize_minutes:
+                finalize_deadline = (
+                    time.monotonic() + args.vod_finalize_minutes * 60
+                )
+                while time.monotonic() < finalize_deadline:
+                    pending = [
+                        item for item in vod_manager.rankings()
+                        if item.get("video_status") != "ready"
+                    ]
+                    if not pending:
+                        break
+                    remaining_finalize = finalize_deadline - time.monotonic()
+                    if remaining_finalize <= 0:
+                        break
+                    time.sleep(min(2.0, remaining_finalize))
+            vod_manager.stop()
+            vod_manager.join(timeout=330)
+            vod_manager.mark_unavailable()
+            if render_rankings:
+                render_rankings()
+        if chunk_dir.exists():
+            shutil.rmtree(chunk_dir)
         print(f"[done] speech     : {speech_path}")
-        for path in ranked_highlight_paths:
-            if path.exists():
-                print(f"[done] highlight  : {path}")
+        if vod_manager:
+            for item in vod_manager.rankings():
+                if item.get("video_status") == "ready":
+                    print(f"[done] highlight  : {item.get('video_path', '')}")
         print(f"[done] chat       : {chat_path}")
+        print(f"[done] ranking    : {manifest_path}")
         print(f"[done] HTML       : {html_path}")
         if preview_server:
             preview_server.stop()

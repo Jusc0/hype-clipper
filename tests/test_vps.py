@@ -6,6 +6,8 @@ import unittest
 from unittest import mock
 
 import hype_web
+import twitch_reaction_probe
+import vod_clip_manager
 import vps_worker
 
 
@@ -41,6 +43,9 @@ class WorkerTests(unittest.TestCase):
                         Path(temporary) / "yaritaiji",
                         1234.5,
                         preserve_published=True,
+                        stream_id="stream-123",
+                        stream_user_id="user-456",
+                        stream_started_at="2026-08-09T01:02:03Z",
                     )
         self.assertIn("--no-preview-server", command)
         self.assertIn("--preserve-published-on-start", command)
@@ -56,10 +61,22 @@ class WorkerTests(unittest.TestCase):
             command[command.index("--out") + 1],
             str(Path(temporary) / "yaritaiji"),
         )
+        self.assertEqual(command[command.index("--stream-id") + 1], "stream-123")
+        self.assertEqual(
+            command[command.index("--stream-user-id") + 1], "user-456"
+        )
 
     def test_stream_start_comes_from_twitch_helix(self):
         response = FakeResponse(
-            {"data": [{"started_at": "2026-08-09T01:02:03Z"}]}
+            {
+                "data": [
+                    {
+                        "id": "stream-123",
+                        "user_id": "user-456",
+                        "started_at": "2026-08-09T01:02:03Z",
+                    }
+                ]
+            }
         )
         with mock.patch.object(
             vps_worker.requests, "get", return_value=response
@@ -71,6 +88,24 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(
             request.call_args.kwargs["params"], {"user_login": "yaritaiji"}
         )
+
+    def test_stream_info_keeps_vod_correlation_fields(self):
+        response = FakeResponse(
+            {
+                "data": [
+                    {
+                        "id": "stream-123",
+                        "user_id": "user-456",
+                        "started_at": "2026-08-09T01:02:03Z",
+                    }
+                ]
+            }
+        )
+        with mock.patch.object(vps_worker.requests, "get", return_value=response):
+            info = vps_worker.get_stream_info("yaritaiji", "token", "client")
+        self.assertEqual(info["stream_id"], "stream-123")
+        self.assertEqual(info["user_id"], "user-456")
+        self.assertGreater(info["started_at_epoch"], 0)
 
     def test_purge_is_limited_to_selected_channel(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -196,6 +231,16 @@ class WebTests(unittest.TestCase):
         self.assertEqual(response.headers["Content-Range"], "bytes 10-19/100")
         response.close()
 
+    def test_manifest_counts_ranked_candidates_before_videos_exist(self):
+        self.add_channel("yaritaiji")
+        channel_dir = self.channel_output("yaritaiji")
+        (channel_dir / "highlights.json").write_text(
+            json.dumps({"highlights": [{"rank": 1}, {"rank": 2}]}),
+            encoding="utf-8",
+        )
+        payload = self.client.get("/api/channels").json
+        self.assertEqual(payload["channels"][0]["highlight_count"], 2)
+
     def test_non_highlight_files_are_not_public(self):
         channel_dir = self.channel_output("yaritaiji")
         (channel_dir / "chat.jsonl").write_text("secret", encoding="utf-8")
@@ -203,6 +248,193 @@ class WebTests(unittest.TestCase):
             self.client.get("/channels/yaritaiji/chat.jsonl").status_code,
             404,
         )
+
+
+class RealtimeProbeTests(unittest.TestCase):
+    def test_live_capture_commands_are_audio_only(self):
+        streamlink_command = (
+            twitch_reaction_probe.build_live_audio_streamlink_command(
+                "https://www.twitch.tv/yaritaiji"
+            )
+        )
+        ffmpeg_command = twitch_reaction_probe.build_live_audio_ffmpeg_command(
+            Path("audio_chunks"), 8
+        )
+        self.assertEqual(streamlink_command[-1], "audio_only")
+        self.assertNotIn("720p", " ".join(streamlink_command))
+        self.assertIn("-vn", ffmpeg_command)
+        self.assertNotIn("0:v:0", ffmpeg_command)
+        self.assertNotIn("video_buffer", " ".join(map(str, ffmpeg_command)))
+
+    def test_existing_trigger_and_preroll_logic_becomes_stream_offset(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            chat_path = root / "chat.jsonl"
+            speech_path = root / "speech.jsonl"
+            speech_rows = [
+                {"offset_start": 20.0, "offset_end": 21.0},
+                {"offset_start": 25.0, "offset_end": 26.0},
+            ]
+            speech_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in speech_rows),
+                encoding="utf-8",
+            )
+            chat_path.write_text(
+                "".join(
+                    json.dumps({"ts": 1000.0 + offset}) + "\n"
+                    for offset in (16.0, 22.0, 30.0)
+                ),
+                encoding="utf-8",
+            )
+            manager = twitch_reaction_probe.RealtimeHighlightManager(
+                chat_path,
+                speech_path,
+                1000.0,
+                8,
+                float("inf"),
+                timeline_offset_seconds=100.0,
+                stream_id="stream-123",
+                highlight_seconds=30.0,
+                preroll_seconds=5.0,
+                previous_lookback_seconds=20.0,
+            )
+            changed = manager.evaluate(60.0)
+            item = manager.top_non_overlapping(1)[0]
+        self.assertTrue(changed)
+        # Peak speech starts at 25s; previous speech starts at 20s; preroll => 15s.
+        self.assertEqual(item["trigger_start"], 15.0)
+        self.assertEqual(item["offset_seconds"], 115.0)
+        self.assertEqual(item["score"], 3)
+
+    def test_waiting_vod_is_rendered_without_blocking_ranking(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "reactions.html"
+            twitch_reaction_probe.build_html(
+                output,
+                "yaritaiji",
+                [
+                    {
+                        "trigger_start": 15.0,
+                        "offset_seconds": 115.0,
+                        "chat_count": 20,
+                        "video_status": "waiting_vod",
+                    }
+                ],
+            )
+            page = output.read_text(encoding="utf-8")
+        self.assertIn("VODへの反映を待っています。", page)
+        self.assertIn('data-start-seconds="115.000"', page)
+
+
+class VodClipTests(unittest.TestCase):
+    def test_twitch_duration_and_range_availability(self):
+        self.assertEqual(vod_clip_manager.parse_twitch_duration("2h3m4s"), 7384)
+        vod = {"duration_seconds": 200.0}
+        self.assertTrue(vod_clip_manager.vod_has_range(vod, 160, 30, 10))
+        self.assertFalse(vod_clip_manager.vod_has_range(vod, 161, 30, 10))
+
+    def test_hls_command_fetches_only_segments_around_offset(self):
+        command, trim_seconds = vod_clip_manager.build_vod_streamlink_command(
+            "https://www.twitch.tv/videos/123", 123.0, 30.0
+        )
+        self.assertIn("--stdout", command)
+        self.assertNotIn("--stream-url", command)
+        self.assertEqual(
+            command[command.index("--hls-start-offset") + 1], "111.000s"
+        )
+        self.assertEqual(
+            command[command.index("--stream-segmented-duration") + 1],
+            "42.000s",
+        )
+        self.assertEqual(command[-1], "720p60,720p,best")
+        self.assertEqual(trim_seconds, 12.0)
+
+    def test_vod_is_matched_by_stream_id_not_latest_video(self):
+        response = FakeResponse(
+            {
+                "data": [
+                    {
+                        "id": "latest-wrong",
+                        "stream_id": "other-stream",
+                        "duration": "4h",
+                        "url": "https://www.twitch.tv/videos/1",
+                    },
+                    {
+                        "id": "correct",
+                        "stream_id": "stream-123",
+                        "duration": "1h2m3s",
+                        "url": "https://www.twitch.tv/videos/2",
+                    },
+                ]
+            }
+        )
+        with mock.patch.object(
+            vod_clip_manager.requests, "get", return_value=response
+        ) as request:
+            vod = vod_clip_manager.find_matching_vod(
+                "user-456",
+                "stream-123",
+                "2026-08-09T01:02:03Z",
+                "client",
+                "token",
+            )
+        self.assertEqual(vod["id"], "correct")
+        self.assertEqual(vod["match_method"], "stream_id")
+        self.assertEqual(request.call_args.kwargs["params"]["type"], "archive")
+
+    def test_missing_stream_metadata_does_not_select_an_arbitrary_vod(self):
+        response = FakeResponse(
+            {
+                "data": [
+                    {
+                        "id": "latest",
+                        "stream_id": "",
+                        "created_at": "2026-08-09T01:02:03Z",
+                        "duration": "4h",
+                        "url": "https://www.twitch.tv/videos/1",
+                    }
+                ]
+            }
+        )
+        with mock.patch.object(
+            vod_clip_manager.requests, "get", return_value=response
+        ):
+            vod = vod_clip_manager.find_matching_vod(
+                "user-456", "", "", "client", "token"
+            )
+        self.assertIsNone(vod)
+
+    def test_missing_user_id_skips_vod_api(self):
+        with mock.patch.object(vod_clip_manager.requests, "get") as request:
+            vod = vod_clip_manager.find_matching_vod(
+                "", "stream-123", "2026-08-09T01:02:03Z", "client", "token"
+            )
+        self.assertIsNone(vod)
+        request.assert_not_called()
+
+    def test_vod_lookup_reloads_shared_access_token(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            token_file = Path(temporary) / "tokens.json"
+            token_file.write_text(
+                json.dumps({"access_token": "fresh-token"}), encoding="utf-8"
+            )
+            manager = vod_clip_manager.VodClipManager(
+                Path(temporary),
+                "yaritaiji",
+                "stream-123",
+                "user-456",
+                "2026-08-09T01:02:03Z",
+                "client",
+                "stale-token",
+                30,
+            )
+            with mock.patch.dict(
+                os.environ, {"TWITCH_TOKEN_FILE": str(token_file)}
+            ), mock.patch.object(
+                vod_clip_manager, "find_matching_vod", return_value=None
+            ) as lookup:
+                manager._lookup_vod(force=True)
+        self.assertEqual(lookup.call_args.args[-1], "fresh-token")
 
 
 if __name__ == "__main__":

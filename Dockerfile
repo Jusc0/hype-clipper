@@ -16,7 +16,7 @@ WORKDIR /app
 COPY requirements.txt requirements-vps.txt ./
 RUN pip install --no-cache-dir -r requirements-vps.txt
 
-COPY twitch_reaction_probe.py vps_worker.py hype_web.py ./
+COPY twitch_reaction_probe.py vod_clip_manager.py vps_worker.py hype_web.py ./
 
 RUN mkdir -p /data /auth /control /models/huggingface \
     && touch /data/.keep /auth/.keep /control/.keep /models/huggingface/.keep \

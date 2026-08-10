@@ -33,6 +33,8 @@ CHANNELS_ROOT = DATA_DIR / "channels"
 CONTROL_DIR = Path(os.environ.get("HYPE_CONTROL_DIR", "/control"))
 CHANNELS_FILE = CONTROL_DIR / "channels.json"
 MAX_CHANNELS = max(1, int(os.environ.get("MAX_CHANNELS", "3")))
+TOKEN_REFRESH_CHECK_SECONDS = 300.0
+TOKEN_REFRESH_BELOW_SECONDS = 900
 JST = timezone(timedelta(hours=9), "JST")
 
 
@@ -226,6 +228,51 @@ def get_twitch_identity(client_id: str, client_secret: str) -> tuple[str, str]:
     return validation["login"], access_token
 
 
+def refresh_running_identity(
+    nick: str,
+    access_token: str,
+    client_id: str,
+    client_secret: str,
+) -> tuple[str, str]:
+    """Refresh without entering the interactive device flow."""
+    tokens = load_tokens()
+    stored_access_token = str(tokens.get("access_token", "")).strip()
+    candidates = [stored_access_token, access_token]
+    best_validation = None
+    best_token = access_token
+    for candidate in dict.fromkeys(token for token in candidates if token):
+        try:
+            validation = validate_token(candidate, client_id)
+        except requests.RequestException as exc:
+            print(f"[auth] periodic validation failed: {exc}", file=sys.stderr)
+            return nick, access_token
+        if not validation:
+            continue
+        best_validation = validation
+        best_token = candidate
+        if int(validation.get("expires_in", 0)) > TOKEN_REFRESH_BELOW_SECONDS:
+            return str(validation.get("login", nick)), candidate
+
+    try:
+        refreshed = refresh_tokens(tokens, client_id, client_secret)
+    except requests.RequestException as exc:
+        print(f"[auth] periodic refresh failed: {exc}", file=sys.stderr)
+        refreshed = None
+    if refreshed:
+        refreshed_token = str(refreshed.get("access_token", "")).strip()
+        try:
+            validation = validate_token(refreshed_token, client_id)
+        except requests.RequestException as exc:
+            print(f"[auth] refreshed token validation failed: {exc}", file=sys.stderr)
+            validation = None
+        if validation:
+            print("[auth] Twitch access token refreshed", flush=True)
+            return str(validation.get("login", nick)), refreshed_token
+    if best_validation:
+        return str(best_validation.get("login", nick)), best_token
+    return nick, access_token
+
+
 def normalized_channel() -> str:
     channel = os.environ.get("TWITCH_CHANNEL", "").strip().lower().lstrip("#")
     if not CHANNEL_RE.fullmatch(channel):
@@ -242,9 +289,15 @@ def normalize_channel(value: str) -> str:
     return channel
 
 
-def get_stream_started_at_epoch(
+def get_stream_info(
     channel: str, access_token: str, client_id: str
-) -> float:
+) -> dict:
+    empty = {
+        "stream_id": "",
+        "user_id": "",
+        "started_at": "",
+        "started_at_epoch": 0.0,
+    }
     try:
         response = requests.get(
             STREAMS_URL,
@@ -258,16 +311,31 @@ def get_stream_started_at_epoch(
         response.raise_for_status()
         streams = response.json().get("data", [])
         if not streams:
-            return 0.0
-        return datetime.fromisoformat(
-            streams[0]["started_at"].replace("Z", "+00:00")
-        ).timestamp()
+            return empty
+        stream = streams[0]
+        started_at = str(stream["started_at"])
+        return {
+            "stream_id": str(stream["id"]),
+            "user_id": str(stream["user_id"]),
+            "started_at": started_at,
+            "started_at_epoch": datetime.fromisoformat(
+                started_at.replace("Z", "+00:00")
+            ).timestamp(),
+        }
     except (requests.RequestException, KeyError, TypeError, ValueError) as exc:
         print(
             f"[stream:{channel}] start time unavailable: {exc}",
             file=sys.stderr,
         )
-        return 0.0
+        return empty
+
+
+def get_stream_started_at_epoch(
+    channel: str, access_token: str, client_id: str
+) -> float:
+    return float(
+        get_stream_info(channel, access_token, client_id)["started_at_epoch"]
+    )
 
 
 def add_numeric_option(command: list[str], env_name: str, option: str) -> None:
@@ -281,6 +349,9 @@ def build_probe_command(
     output_dir: Path | None = None,
     stream_started_at_epoch: float = 0.0,
     preserve_published: bool = False,
+    stream_id: str = "",
+    stream_user_id: str = "",
+    stream_started_at: str = "",
 ) -> list[str]:
     output_dir = output_dir or DATA_DIR
     command = [
@@ -295,6 +366,13 @@ def build_probe_command(
         "--stream-started-at-epoch",
         str(stream_started_at_epoch),
     ]
+    for option, value in (
+        ("--stream-id", stream_id),
+        ("--stream-user-id", stream_user_id),
+        ("--stream-started-at", stream_started_at),
+    ):
+        if value:
+            command.extend([option, value])
     for env_name, option in (
         ("DURATION_MINUTES", "--duration-minutes"),
         ("HIGHLIGHT_SECONDS", "--highlight-seconds"),
@@ -304,6 +382,9 @@ def build_probe_command(
         ("TOP_COUNT", "--top-count"),
         ("PREVIEW_INTERVAL_MINUTES", "--preview-interval-minutes"),
         ("SEGMENT_SECONDS", "--segment-seconds"),
+        ("VOD_POLL_SECONDS", "--vod-poll-seconds"),
+        ("VOD_READY_MARGIN_SECONDS", "--vod-ready-margin-seconds"),
+        ("VOD_FINALIZE_MINUTES", "--vod-finalize-minutes"),
     ):
         add_numeric_option(command, env_name, option)
     if preserve_published:
@@ -392,6 +473,7 @@ def main() -> int:
     completed: dict[str, str] = {}
     cold_start_requests = load_desired_channels(default_channel)
     shutdown_requested = False
+    next_token_refresh_check = time.monotonic() + TOKEN_REFRESH_CHECK_SECONDS
 
     def request_shutdown(_signum, _frame):
         nonlocal shutdown_requested
@@ -402,6 +484,15 @@ def main() -> int:
     write_status("running", max_channels=MAX_CHANNELS)
 
     while not shutdown_requested:
+        if time.monotonic() >= next_token_refresh_check:
+            nick, access_token = refresh_running_identity(
+                nick, access_token, client_id, client_secret
+            )
+            child_env["TWITCH_NICK"] = nick
+            child_env["TWITCH_OAUTH_TOKEN"] = access_token
+            next_token_refresh_check = (
+                time.monotonic() + TOKEN_REFRESH_CHECK_SECONDS
+            )
         desired = load_desired_channels(default_channel)
 
         for channel, running in list(active.items()):
@@ -431,14 +522,17 @@ def main() -> int:
                 output_dir.mkdir(parents=True, exist_ok=True)
             else:
                 purge_channel_data(channel)
-            stream_started_at = get_stream_started_at_epoch(
+            stream_info = get_stream_info(
                 channel, access_token, client_id
             )
             command = build_probe_command(
                 channel,
                 output_dir,
-                stream_started_at,
+                stream_info["started_at_epoch"],
                 preserve_published=preserve_published,
+                stream_id=stream_info["stream_id"],
+                stream_user_id=stream_info["user_id"],
+                stream_started_at=stream_info["started_at"],
             )
             write_channel_status(channel, "starting")
             child = subprocess.Popen(
@@ -454,7 +548,8 @@ def main() -> int:
                 channel,
                 "running",
                 pid=child.pid,
-                stream_started_at_epoch=stream_started_at,
+                stream_started_at_epoch=stream_info["started_at_epoch"],
+                stream_id=stream_info["stream_id"],
             )
             print(f"[control] started #{channel} (pid {child.pid})", flush=True)
 

@@ -1,215 +1,123 @@
 # Hype Clipper
 
-Twitchライブを配信終了まで監視し、チャットが盛り上がった上位10区間を、それぞれきっかけの発言から30秒ずつ映像付きで切り抜きます。
-映像は720pを優先して収録し、最終動画も720pで保存します。
-映像全編は保存せず、5秒セグメントのローリングバッファとして既定では直近約65秒だけ保持します。チャット盛り上がり候補の映像だけを一時退避します。
+Twitch配信の`audio_only`とチャットをリアルタイム監視し、VADとチャット密度から盛り上がり上位10件を更新します。映像は常時受信・録画せず、対応するTwitch VODが対象地点まで公開された時点で30秒動画を生成します。
 
-書き起こしは行いません。軽量な音声区間検出（VAD）で発言の開始・終了時刻だけを記録し、既定では2.5秒以内で続く音声を同じ発言としてまとめます。切り抜きは、きっかけと推定した発言の1つ前の発言開始より5秒前から始めます。前の発言が20秒より離れている場合は、きっかけの発言開始より5秒前から始めます。
+現在の監視上限は3配信者です。ランキングと動画は配信者ごとに分離され、PCとスマートフォンのWeb UIから切り替えて閲覧できます。YouTubeアップロード機能はありません。
 
-## 必要なもの
+## 処理方式
 
-- Python 3.10+
-- ffmpeg
+リアルタイム処理は次の流れです。
+
+1. Streamlinkで`audio_only`とTwitch Chatを受信
+2. FFmpegでモノラル16kHz PCMの8秒WAVチャンクへ変換
+3. VADで発話区間だけを記録（書き起こしは行わない）
+4. 処理済みWAVチャンクを削除
+5. 従来のVAD・チャット密度・発話位置ロジックで候補を採点
+6. 配信開始からの`offset_seconds`を`highlights.json`へ保存し、動画を待たずランキングを更新
+7. Twitch APIで`stream_id`が一致するアーカイブVODを確認
+8. VODが対象区間まで伸びたら、StreamlinkのHLS開始位置・区間長指定で必要なセグメントだけを取得
+9. 720pを優先して30秒MP4を生成し、Web UIへ反映
+
+8秒チャンクは、次のチャンクが作られてからVADへ渡します。そのため通常時にディスクへ存在する音声は、処理対象と受信中を合わせて約16秒です。VAD処理が終わったチャンクは直ちに削除し、後の動画生成目的では保存しません。
+
+VOD取得時は先頭から読み進めません。クリップ開始位置の12秒前から約42秒分を指定し、HLSセグメント境界へ丸められた必要範囲だけを取得します。VOD全体はダウンロードしません。
+
+## クリップ開始位置
+
+30秒の評価窓ごとに、盛り上がり開始付近の発話をVAD結果から探します。20秒以内に1つ前の発話があればその開始位置を採用し、さらに既定の5秒プリロールを引きます。この従来ロジックで決まった開始位置へ、収集開始時点の配信経過時間を足した値が`offset_seconds`です。
+
+既定値:
+
+- クリップ: 30秒
+- プリロール: 5秒
+- 1つ前の発話を探す範囲: 20秒
+- 発話を結合する無音間隔: 2.5秒
+- VAD音声チャンク: 8秒
+- VOD確認間隔: 60秒
+- 配信終了後のVOD最終確認: 最大15分
+- ランキング: 上位10件
+- 同時監視: 最大3配信者
+
+## 動画ステータス
+
+ランキング候補には次の状態があります。
+
+- `waiting_vod`: VODの出現または対象区間の反映待ち
+- `generating`: 対象HLS区間から動画を生成中
+- `ready`: Web UIで再生可能
+- `unavailable`: 配信終了後も利用できるVODがない
+- `failed`: 生成エラー。配信中はポーリング時に再試行
+
+候補が上位10件から外れると、その候補用に生成済みの動画も削除します。順位が変わっただけなら同じ候補の動画は作り直しません。
+
+## ローカル実行
+
+必要なもの:
+
+- Python 3.10以上
+- FFmpeg / ffprobe
 - TwitchアプリのClient IDとClient Secret
 
 ```powershell
 pip install -r requirements.txt
+Copy-Item config.example.json config.local.json
 ```
 
-`ffmpeg -version` が通ることも確認してください。
-
-## Twitch認証設定
-
-Twitch Developer Consoleでアプリを作成し、OAuth Redirect URLへ次を登録します。
+Twitch Developer ConsoleのOAuth Redirect URLへ次を登録します。
 
 ```text
 http://localhost:3000
 ```
 
-`config.example.json`を`config.local.json`へコピーし、認証情報を記入します。`config.local.json`はGitの対象外です。
-
-```powershell
-Copy-Item config.example.json config.local.json
-notepad config.local.json
-```
-
-```json
-{
-  "twitch_client_id": "your-client-id",
-  "twitch_client_secret": "your-client-secret"
-}
-```
-
-環境変数を使う場合は次のように設定できます。環境変数が`config.local.json`より優先されます。
-
-```powershell
-$env:TWITCH_CLIENT_ID="your-client-id"
-$env:TWITCH_CLIENT_SECRET="your-client-secret"
-```
-
-## ターミナルから実行
-
-PowerShell:
-
-```powershell
-.\.venv\Scripts\python.exe -u twitch_auth.py --run-probe
-```
-
-引数を省略した場合は、`yaritaiji`を配信終了まで収集し、30秒の切り抜きを発言開始の5秒前から作成します。発言の結合間隔は2.5秒、1つ前の発言を探す範囲は20秒です。
-
-これは次の指定と同じです。
+配信終了まで監視する基本コマンド:
 
 ```powershell
 .\.venv\Scripts\python.exe -u twitch_auth.py --run-probe --channel yaritaiji --duration-minutes 0 --highlight-seconds 30 --preroll-seconds 5 --utterance-gap-seconds 2.5 --previous-lookback-seconds 20
 ```
 
-ブラウザでTwitch認証すると収集が始まり、配信終了を検知すると自動終了します。
+`--duration-minutes 0`または時間指定なしは配信終了まで、正の値を指定するとその分数で終了します。
 
-配信者IDをコマンドに直接指定することもできます。
-
-```powershell
-.\.venv\Scripts\python.exe -u twitch_auth.py --run-probe --channel indegnasen0706
-```
-
-途中で終了する場合は `Ctrl+C`。
-
-配信終了を待たず指定時間で止める場合は、分単位で指定できます。
-
-```powershell
-.\.venv\Scripts\python.exe -u twitch_auth.py --run-probe --channel indegnasen0706 --duration-minutes 15
-```
-
-`--duration-minutes 0`を指定した場合も、デフォルトと同じく配信終了まで継続します。
-
-切り抜き時間を変える場合は、秒単位で指定できます。例えば45秒にする場合:
-
-```powershell
-.\.venv\Scripts\python.exe -u twitch_auth.py --run-probe --channel indegnasen0706 --highlight-seconds 45
-```
-
-開始余白や発言間隔も秒単位で指定できます。
-
-```powershell
-.\.venv\Scripts\python.exe -u twitch_auth.py --run-probe --channel indegnasen0706 --preroll-seconds 3 --utterance-gap-seconds 2.5 --previous-lookback-seconds 20
-```
-
-- `--preroll-seconds`: 選んだ発言開始より何秒前から切り抜くか
-- `--utterance-gap-seconds`: 何秒以内で続く音声を同じ発言にまとめるか
-- `--previous-lookback-seconds`: 1つ前の発言を採用する最大間隔
-
-ローリングバッファは、切り抜き時間・開始余白・発言間隔に合わせて自動調整されます。
-
-## 配信中の暫定ハイライト
-
-収集中は1分ごとに暫定上位10件と再生用の仮動画を更新します。ターミナルに表示される `PC preview` または `phone preview` のURLを開くと、ページを再読み込みせずカード部分だけが自動更新されます。
-同じ候補の順位が変わっただけなら仮動画を再利用し、暫定上位10件から外れた候補の仮動画は削除します。
-
-PCとスマホを同じWi-Fiへ接続すると、ターミナルに表示される `phone preview` のURLをスマホで開けます。Windowsファイアウォールの確認が表示された場合は、プライベートネットワークでのPython通信を許可してください。プレビューはスクリプト実行中だけ同じLAN内へ公開されます。
-
-収集を停止したあと、保存済み結果だけをPCやスマホで見る場合:
-
-```powershell
-.\.venv\Scripts\python.exe -u serve_preview.py
-```
-
-表示された `phone preview` をスマホで開き、終了するときは `Ctrl+C` を押します。
-
-更新間隔と表示件数も変更できます。
-
-```powershell
-.\.venv\Scripts\python.exe -u twitch_auth.py --run-probe --channel indegnasen0706 --preview-interval-minutes 1 --top-count 10
-```
-
-配信終了後は、正確な開始位置で変換した確定動画へ置き換わります。処理済みのVAD音声チャンクは順次削除されるため、長時間配信でも音声ファイルが増え続けません。
-
-出力:
+主な出力:
 
 ```text
 reaction_session/
   chat.jsonl
   speech_segments.jsonl
+  highlights.json
   reactions.html
-  highlight_chat_1.mp4
-  highlight_chat_2.mp4
-  ...
-  highlight_chat_10.mp4
-  audio_chunks/
+  preview_vod_<candidate-id>.mp4
+  audio_chunks/                  # 実行中だけ。処理済みから削除
 ```
 
-`reactions.html` では、重複しないチャット盛り上がり上位10件を再生できます。
+`highlights.json`には配信者ID、`stream_id`、配信開始時刻、`offset_seconds`、スコア、順位、動画状態、動画パス、VOD ID・URL・照合方法などを保存します。
 
-`speech_segments.jsonl`には発言内容ではなく、VADが検出した開始・終了時刻だけを保存します。個別発言は画面に表示しません。
+## VPS（Docker Compose + Flask + Caddy）
 
-### 反応時間を狭める
-
-```powershell
-python twitch_reaction_probe.py --reaction-start 2 --reaction-end 6
-```
-
-最初は意味判定や感情分類は入れず、「時間だけで発言→反応がどこまで成立するか」を見るための版です。
-
-## VPS版（Docker Compose + Flask + Caddy）
-
-VPS版では、Twitchの収集・VAD・切り抜きをworkerコンテナで行い、Flaskが結果と監視操作画面を配信し、CaddyがHTTPSとパスワード保護を担当します。PCとスマホはブラウザーで見るだけです。最大3配信者を同時監視し、チャット・動画・上位10件ランキングは配信者ごとに完全分離します。
-
-このVPSでは、独自ドメインがなくても次のホスト名を使用できます。`sslip.io`のDNSによって`163.44.122.195`へ解決されます。
-
-```text
-https://hype.163-44-122-195.sslip.io/
-```
-
-### 初期設定
-
-VPSで設定ファイルを作ります。
+Flaskが監視画面と動画を配信し、CaddyがHTTPSとBasic認証を担当します。workerが最大3配信者の`audio_only`・チャット・VAD・ランキング・VOD動画生成を担当します。
 
 ```bash
 cp .env.example .env
 chmod 600 .env
-```
-
-Caddy用の閲覧パスワードをハッシュ化します。
-
-```bash
-docker run --rm caddy:2-alpine caddy hash-password --plaintext '任意の強いパスワード'
-```
-
-出力されたハッシュを`.env`の`HYPE_BASIC_AUTH_HASH`へ、シングルクォートを付けて保存します。続けてTwitchのClient ID、Client Secret、配信者IDを設定します。
-
-```dotenv
-HYPE_BASIC_AUTH_USER=hype
-HYPE_BASIC_AUTH_HASH='$2a$...'
-TWITCH_CLIENT_ID=...
-TWITCH_CLIENT_SECRET=...
-TWITCH_CHANNEL=yaritaiji
-MAX_CHANNELS=3
-```
-
-### 起動
-
-まずWeb画面を起動します。
-
-```bash
 docker compose up -d --build web caddy
-```
-
-workerを起動し、初回だけTwitchのデバイス認証を行います。
-
-```bash
 docker compose up -d --build worker
 docker compose logs -f worker
 ```
 
-ログに表示されるTwitch認証URLとコードをPCまたはスマホで開きます。認証後のアクセストークンとリフレッシュトークンはDockerボリュームへ保存され、Gitや閲覧用コンテナには渡されません。
+主な環境変数:
 
-HTTPS画面の入力欄へ配信者IDを入れると、2人まで監視対象を追加できます。配信者タブを押すと、ページを移動せずランキングを直接切り替えられます。ハイライトは「ランキング順」と「新着順」で並べ替えられます。「停止して削除」は対象配信者の保存先だけを消し、ほかの配信者のランキングには影響しません。同じ配信者を収集し直す場合は、停止削除後にIDをもう一度追加します。
-
-配信終了後も管理workerは待機するため、別の配信者を画面から追加できます。ハイライト時刻はTwitchの配信開始からの経過時間で表示し、更新時刻とログは日本時間です。
-
-設定やコードを変更した場合は、`start`ではなく次を使用します。
-
-```bash
-docker compose up -d --build worker
+```dotenv
+TWITCH_CLIENT_ID=...
+TWITCH_CLIENT_SECRET=...
+TWITCH_CHANNEL=yaritaiji
+HIGHLIGHT_SECONDS=30
+SEGMENT_SECONDS=8
+VOD_POLL_SECONDS=60
+VOD_READY_MARGIN_SECONDS=10
+VOD_FINALIZE_MINUTES=15
+MAX_CHANNELS=3
 ```
+
+Twitchユーザートークンは5分ごとに期限を確認し、残り15分以下なら共有トークンファイルへ更新します。各VOD確認は共有ファイルから最新トークンを読みます。
 
 状態確認:
 
@@ -218,8 +126,17 @@ docker compose ps
 docker compose logs --tail=100 worker
 ```
 
-`docker compose down`では動画・認証・Caddy証明書の名前付きボリュームは保持されます。`docker compose down -v`は保存データを削除するため使用しないでください。
+## テスト
 
-### 1GB VPS向け設定
+```bash
+python -m unittest tests.test_vps
+```
 
-`compose.yaml`では最大3配信者を収めるworker全体を700MB、Flask 112MB、Caddy 96MBに制限しています。書き起こしは行わず、Gunicornは1 worker・2 threadsです。複数配信者の720p切り抜き生成は共有ロックで直列化し、同時エンコードによるCPU集中を避けます。ホスト側には2GB程度のswapを用意してください。
+実配信を使う一時スモークテスト:
+
+```bash
+python -m tests.audio_smoke rtainjapan
+python -m tests.vod_smoke --generate rtainjapan
+```
+
+スモークテストの音声・動画は一時ディレクトリにのみ作成し、終了時に破棄します。

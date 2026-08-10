@@ -72,6 +72,9 @@ def main() -> None:
         "TOP_COUNT": "10",
         "PREVIEW_INTERVAL_MINUTES": "1",
         "SEGMENT_SECONDS": "8",
+        "VOD_POLL_SECONDS": "60",
+        "VOD_READY_MARGIN_SECONDS": "10",
+        "VOD_FINALIZE_MINUTES": "15",
         "MAX_CHANNELS": "3",
     }
     args.output.write_text(
