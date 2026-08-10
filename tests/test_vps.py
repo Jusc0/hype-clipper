@@ -314,7 +314,6 @@ class RealtimeProbeTests(unittest.TestCase):
                 "yaritaiji",
                 [
                     {
-                        "trigger_start": 15.0,
                         "offset_seconds": 115.0,
                         "chat_count": 20,
                         "video_status": "waiting_vod",

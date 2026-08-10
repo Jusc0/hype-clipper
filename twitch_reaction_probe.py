@@ -1074,10 +1074,13 @@ def build_html(output, channel, highlights, duration=HIGHLIGHT_SECONDS,
                 "failed": "動画生成に失敗しました。再試行します。",
             }.get(video_status, "動画候補を準備中です。")
             video_html = f'<div class="waiting">{status_text}</div>'
-        timeline_start = max(0.0, float(item.get(
-            "offset_seconds",
-            item["trigger_start"] + timeline_offset_seconds,
-        )))
+        if "offset_seconds" in item:
+            timeline_start = max(0.0, float(item["offset_seconds"]))
+        else:
+            timeline_start = max(
+                0.0,
+                float(item["trigger_start"]) + timeline_offset_seconds,
+            )
         cards.append(
             f'<section class="highlight" data-rank="{rank}" '
             f'data-start-seconds="{timeline_start:.3f}" '
