@@ -59,11 +59,11 @@ DASHBOARD_HTML = r'''<!doctype html>
 <style>
 :root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#0e0e10;color:#efeff1;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}main{width:min(1380px,96vw);margin:28px auto 70px}.add{display:flex;gap:9px;background:#18181b;border:1px solid #2f2f35;border-radius:14px;padding:13px;margin-bottom:20px}.add input{min-width:0;flex:1;border:1px solid #53535f;border-radius:8px;background:#0e0e10;color:#fff;padding:12px;font-size:16px}.add button,.actions button{border:0;border-radius:8px;padding:10px 14px;font-weight:700;cursor:pointer}.add button{background:#9147ff;color:#fff}.tabs{display:flex;gap:8px;overflow-x:auto;padding:2px 2px 9px;scrollbar-width:thin}.tab{white-space:nowrap;border:1px solid #3a3a44;background:#18181b;color:#adadb8;border-radius:10px 10px 0 0;padding:11px 16px;font-size:15px;font-weight:700;cursor:pointer}.tab.active{background:#2b1745;border-color:#9147ff;color:#fff}.tab small{margin-left:7px;color:#bf94ff}.panel{background:#18181b;border:1px solid #2f2f35;border-radius:0 12px 12px 12px;overflow:hidden}.panel-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:13px 15px;border-bottom:1px solid #2f2f35}.name{font-size:20px;font-weight:750}.state{display:inline-block;margin-left:8px;padding:4px 9px;border-radius:999px;background:#26262c;color:#adadb8;font-size:13px}.state.running{background:#153d2a;color:#6ee7a2}.state.error{background:#491c24;color:#ff9aa8}.details{color:#adadb8;font-size:13px;margin-top:5px}.actions{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.sorts{display:flex;border:1px solid #53535f;border-radius:8px;overflow:hidden}.sort{border:0!important;border-radius:0!important;background:#26262c;color:#adadb8;padding:10px 12px!important}.sort.active{background:#9147ff;color:#fff}.delete{background:#4b2028;color:#ffb3bd}.highlights{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px;align-items:start;padding:14px;background:#0e0e10}.highlight{background:#18181b;border:1px solid #2f2f35;border-radius:12px;padding:12px}.highlight h2{font-size:20px;margin:4px 4px 12px}.highlight video{display:block;width:100%;max-height:78vh;background:#000;border-radius:8px}.highlight-meta{color:#adadb8;font-size:13px;margin:10px 4px 3px}.waiting{color:#adadb8;background:#18181b;border:1px solid #2f2f35;border-radius:12px;padding:24px}.empty{color:#adadb8;background:#18181b;border:1px dashed #53535f;border-radius:14px;padding:26px}.notice{min-height:24px;color:#bf94ff;margin:5px 2px}.limit{color:#adadb8;font-size:13px;margin-top:14px}@media(max-width:600px){.add{flex-direction:column}.add button{width:100%}.panel-head{align-items:flex-start;flex-direction:column}.actions{width:100%}.sorts{flex:1}.sort{flex:1}.delete{width:100%}.highlights{grid-template-columns:1fr;padding:10px}}
 </style></head><body><main>
-<form class="add" id="addForm"><input id="channelInput" name="channel" autocomplete="off" maxlength="200" placeholder="Twitch配信者ID またはURL" required><button type="submit">監視に追加</button></form>
+<form class="add" id="addForm"><input id="channelInput" name="channel" autocomplete="off" maxlength="200" placeholder="Twitch配信者ID またはURL" required><button type="submit">監視に追加</button><label style="display:flex;align-items:center;gap:6px;white-space:nowrap">Speech gap <input id="gapInput" type="number" min="0.5" max="10" step="0.1" value="3.5" style="width:75px;border:1px solid #53535f;border-radius:8px;background:#0e0e10;color:#fff;padding:10px"><span>秒</span></label><label style="display:flex;align-items:center;gap:6px;white-space:nowrap">投稿まで <input id="idleInput" type="number" min="0" max="240" step="1" value="0" style="width:70px;border:1px solid #53535f;border-radius:8px;background:#0e0e10;color:#fff;padding:10px"><span>分更新なし</span></label><button id="saveSettings" type="button">適用</button><button id="publishSelected" type="button">選択中をYouTubeへ投稿</button></form>
 <div class="notice" id="notice"></div><div class="tabs" id="tabs" role="tablist"></div><section class="panel" id="panel" hidden><div class="panel-head"><div><div><span class="name" id="selectedName"></span><span class="state" id="selectedState"></span></div><div class="details" id="selectedDetails"></div></div><div class="actions"><div class="sorts" aria-label="並び順"><button class="sort" data-sort="rank">ランキング順</button><button class="sort" data-sort="newest">新着順</button></div><button class="delete" id="deleteSelected">停止して削除</button></div></div><div class="highlights" id="rankings"><div class="waiting">ランキングを読み込み中です。</div></div></section><div class="empty" id="empty">読み込み中です。</div><div class="limit" id="limit"></div>
 </main><script>
 const states={running:"収集中",starting:"開始中",stopping:"停止中",stopped:"配信終了",error:"エラー",not_started:"待機中",unknown:"状態不明"};
-const tabs=document.querySelector("#tabs"),panel=document.querySelector("#panel"),empty=document.querySelector("#empty"),rankings=document.querySelector("#rankings"),notice=document.querySelector("#notice"),input=document.querySelector("#channelInput");
+const tabs=document.querySelector("#tabs"),panel=document.querySelector("#panel"),empty=document.querySelector("#empty"),rankings=document.querySelector("#rankings"),notice=document.querySelector("#notice"),input=document.querySelector("#channelInput"),gapInput=document.querySelector("#gapInput"),idleInput=document.querySelector("#idleInput"),saveSettings=document.querySelector("#saveSettings");
 let channels=[],maxChannels=2,selectedChannel=decodeURIComponent(location.hash.slice(1)||""),rankingChannel="",rankingToken="",rankingLoading=false;
 let sortMode="rank";try{sortMode=localStorage.getItem("hypeSortMode")||"rank"}catch(_){}
 const esc=value=>String(value??"").replace(/[&<>"']/g,ch=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
@@ -73,11 +73,13 @@ function selectChannel(channel){selectedChannel=channel;history.replaceState(nul
 function cardRank(card){return Number(card.dataset.rank||parseInt(card.querySelector("h2")?.textContent||"999",10))}function cardStart(card){if(card.dataset.startSeconds)return Number(card.dataset.startSeconds);const match=(card.querySelector(".highlight-meta")?.textContent||"").match(/(\d+):(\d+):(\d+)/);return match?Number(match[1])*3600+Number(match[2])*60+Number(match[3]):0}function applyRankingSort(container=rankings){const cards=[...container.querySelectorAll(":scope > .highlight")];cards.sort((left,right)=>sortMode==="newest"?cardStart(right)-cardStart(left):cardRank(left)-cardRank(right));cards.forEach(card=>container.appendChild(card));document.querySelectorAll(".sort").forEach(button=>button.classList.toggle("active",button.dataset.sort===sortMode))}
 function render(){document.querySelector("#limit").textContent=`${channels.length} / ${maxChannels} 配信者を監視設定中`;if(!channels.length){tabs.innerHTML="";panel.hidden=true;empty.hidden=false;empty.textContent="配信者IDを入力して監視を開始してください。";return}if(!channels.some(item=>item.channel===selectedChannel))selectedChannel=channels[0].channel;tabs.innerHTML=channels.map(item=>`<button class="tab ${item.channel===selectedChannel?"active":""}" role="tab" aria-selected="${item.channel===selectedChannel}" data-channel="${esc(item.channel)}">${esc(item.channel)}<small>${item.highlight_count||0}</small></button>`).join("");const item=channels.find(entry=>entry.channel===selectedChannel),state=item.status.state||"not_started";empty.hidden=true;panel.hidden=false;document.querySelector("#selectedName").textContent=item.channel;const stateNode=document.querySelector("#selectedState");stateNode.textContent=states[state]||state;stateNode.className=`state ${state}`;const updated=jst(item.content_updated_at||item.status.updated_at);document.querySelector("#selectedDetails").textContent=`暫定ハイライト ${item.highlight_count||0}件${updated?`・更新 ${updated}`:""}`;if(rankingChannel!==item.channel){rankingChannel=item.channel;rankingToken="";rankings.innerHTML='<div class="waiting">ランキングを読み込み中です。</div>'}refreshRanking()}
 async function refreshRanking(){const channel=selectedChannel;if(!channel||rankingLoading||[...rankings.querySelectorAll("video")].some(video=>!video.paused&&!video.ended))return;rankingLoading=true;try{const pageUrl=`/channels/${encodeURIComponent(channel)}/reactions.html`,response=await fetch(`${pageUrl}?_=${Date.now()}`,{cache:"no-store"}),source=await response.text();if(channel!==selectedChannel)return;const doc=new DOMParser().parseFromString(source,"text/html"),sourceList=doc.querySelector(".highlights"),token=doc.body?.dataset.updateToken||source.length;if(!sourceList){rankings.innerHTML='<div class="waiting">ランキングを準備中です。</div>';return}if(rankingToken===token){applyRankingSort();return}sourceList.querySelectorAll("video[src]").forEach(video=>video.src=new URL(video.getAttribute("src"),new URL(pageUrl,location.origin)).href);applyRankingSort(sourceList);rankings.innerHTML=sourceList.innerHTML;rankingToken=token;applyRankingSort()}catch(error){notice.textContent=error.message}finally{rankingLoading=false}}
-async function refresh(){try{const body=await api("/api/channels");channels=body.channels;maxChannels=body.max_channels;render()}catch(error){notice.textContent=error.message}}
+async function refresh(){try{const [body,settings]=await Promise.all([api("/api/channels"),api("/api/settings")]);channels=body.channels;maxChannels=body.max_channels;gapInput.value=settings.utterance_gap_seconds;idleInput.value=settings.publish_after_idle_minutes;render()}catch(error){notice.textContent=error.message}}
 document.querySelector("#addForm").addEventListener("submit",async event=>{event.preventDefault();notice.textContent="追加しています…";try{const result=await api("/api/channels",{method:"POST",body:JSON.stringify({channel:input.value})});selectedChannel=result.channel;input.value="";notice.textContent="監視を追加しました。";await refresh()}catch(error){notice.textContent=error.message}});
 tabs.addEventListener("click",event=>{const tab=event.target.closest("button[data-channel]");if(tab)selectChannel(tab.dataset.channel)});
+saveSettings.addEventListener("click",async()=>{saveSettings.disabled=true;try{const gap=Number(gapInput.value),idle=Number(idleInput.value);await api("/api/settings",{method:"PATCH",body:JSON.stringify({utterance_gap_seconds:gap,publish_after_idle_minutes:idle})});notice.textContent=`設定を適用しました（Speech gap ${gap}秒、${idle?`${idle}分更新なしで投稿`:'自動投稿停止'}）。`;await refresh()}catch(error){notice.textContent=error.message}finally{saveSettings.disabled=false}});
 document.querySelector(".sorts").addEventListener("click",event=>{const button=event.target.closest("button[data-sort]");if(!button)return;sortMode=button.dataset.sort;try{localStorage.setItem("hypeSortMode",sortMode)}catch(_){}applyRankingSort()});
 document.querySelector("#deleteSelected").addEventListener("click",async event=>{const channel=selectedChannel;if(!channel||!confirm(`${channel} の監視を停止し、ランキングと動画を削除しますか？`))return;event.currentTarget.disabled=true;try{await api(`/api/channels/${encodeURIComponent(channel)}`,{method:"DELETE"});notice.textContent=`${channel} を停止して削除します。`;selectedChannel="";rankingChannel="";rankingToken="";rankings.innerHTML='<div class="waiting">ランキングを読み込み中です。</div>';await refresh()}catch(error){notice.textContent=error.message}finally{event.currentTarget.disabled=false}});
+document.querySelector("#publishSelected").addEventListener("click",async event=>{const channel=selectedChannel;if(!channel||!confirm(`${channel} の現在のランキングを確定してYouTubeへ投稿しますか？`))return;event.currentTarget.disabled=true;try{await api(`/api/channels/${encodeURIComponent(channel)}/publish`,{method:"POST"});notice.textContent=`${channel} を確定してYouTube投稿を開始します。`;await refresh()}catch(error){notice.textContent=error.message}finally{event.currentTarget.disabled=false}});
 refresh();setInterval(refresh,5000);
 </script></body></html>'''
 
@@ -120,6 +122,14 @@ def create_app(
                 continue
             entries.append({**entry, "channel": channel})
         return entries[:max_channels]
+
+    def read_settings() -> dict:
+        try:
+            payload = json.loads(channels_file.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return {}
+        settings = payload.get("settings", {})
+        return settings if isinstance(settings, dict) else {}
 
     def write_entries(entries: list[dict]) -> None:
         atomic_write_json(channels_file, {"channels": entries})
@@ -166,6 +176,10 @@ def create_app(
             "highlight_count": highlight_count,
             "content_updated_at": content_updated_at,
             "url": f"/channels/{channel}/reactions.html",
+            "utterance_gap_seconds": read_settings().get(
+                "utterance_gap_seconds",
+                float(os.environ.get("UTTERANCE_GAP_SECONDS", "3.5")),
+            ),
         }
 
     @app.after_request
@@ -205,6 +219,69 @@ def create_app(
             channels=[channel_payload(entry) for entry in entries],
         )
 
+    @app.get("/api/settings")
+    def api_settings():
+        raw = read_settings().get("utterance_gap_seconds")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = float(os.environ.get("UTTERANCE_GAP_SECONDS", "3.5"))
+        raw_idle = read_settings().get("publish_after_idle_minutes", 0)
+        try:
+            idle_minutes = float(raw_idle)
+        except (TypeError, ValueError):
+            idle_minutes = 0
+        return jsonify(
+            utterance_gap_seconds=value,
+            publish_after_idle_minutes=idle_minutes,
+        )
+
+    @app.patch("/api/settings")
+    def update_settings():
+        if not request.is_json:
+            return jsonify(error="JSONで設定値を送信してください"), 415
+        try:
+            value = float((request.get_json() or {}).get("utterance_gap_seconds"))
+        except (TypeError, ValueError):
+            return jsonify(error="speech gapは数値で指定してください"), 400
+        if not 0.5 <= value <= 10:
+            return jsonify(error="speech gapは0.5〜10秒の範囲で指定してください"), 400
+        try:
+            idle_minutes = float(
+                (request.get_json() or {}).get("publish_after_idle_minutes", 0)
+            )
+        except (TypeError, ValueError):
+            return jsonify(error="投稿までの更新なし時間は数値で指定してください"), 400
+        if not 0 <= idle_minutes <= 240:
+            return jsonify(error="投稿までの更新なし時間は0〜240分で指定してください"), 400
+        with config_lock:
+            try:
+                payload = json.loads(channels_file.read_text(encoding="utf-8"))
+            except (FileNotFoundError, OSError, json.JSONDecodeError):
+                payload = {"channels": []}
+            entries = payload.get("channels", [])
+            if not isinstance(entries, list):
+                entries = []
+            for entry in entries:
+                if isinstance(entry, dict):
+                    entry["request_id"] = secrets.token_urlsafe(18)
+            payload["channels"] = entries
+            existing_settings = payload.get("settings", {})
+            if not isinstance(existing_settings, dict):
+                existing_settings = {}
+            payload["settings"] = {
+                **existing_settings,
+                "utterance_gap_seconds": value,
+                "publish_after_idle_minutes": idle_minutes,
+            }
+            atomic_write_json(channels_file, payload)
+        return jsonify(
+            utterance_gap_seconds=value,
+            publish_after_idle_minutes=idle_minutes,
+            accepted=True,
+            restarting=True,
+        ), 202
+
     @app.post("/api/channels")
     def add_channel():
         if not request.is_json:
@@ -242,6 +319,25 @@ def create_app(
                 return jsonify(error="監視対象にありません"), 404
             write_entries(remaining)
         return jsonify(channel=channel, deleting=True), 202
+
+    @app.post("/api/channels/<channel>/publish")
+    def publish_channel(channel: str):
+        try:
+            channel = normalize_channel(channel)
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+        with config_lock:
+            try:
+                payload = json.loads(channels_file.read_text(encoding="utf-8"))
+            except (FileNotFoundError, OSError, json.JSONDecodeError):
+                return jsonify(error="監視設定が見つかりません"), 404
+            entries = payload.get("channels", [])
+            for entry in entries:
+                if isinstance(entry, dict) and entry.get("channel") == channel:
+                    entry["publish_request_id"] = secrets.token_urlsafe(18)
+                    atomic_write_json(channels_file, payload)
+                    return jsonify(channel=channel, accepted=True, finishing=True), 202
+        return jsonify(error="監視設定が見つかりません"), 404
 
     @app.get("/api/channels/<channel>/highlights")
     def api_highlights(channel: str):

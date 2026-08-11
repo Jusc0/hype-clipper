@@ -969,6 +969,7 @@ def build_probe_command(
     stream_id: str = "",
     stream_user_id: str = "",
     stream_started_at: str = "",
+    utterance_gap_seconds: float | None = None,
 ) -> list[str]:
 
     output_dir = (
@@ -1079,6 +1080,9 @@ def build_probe_command(
             env_name,
             option,
         )
+
+    if utterance_gap_seconds is not None:
+        command.extend(["--utterance-gap-seconds", f"{float(utterance_gap_seconds):g}"])
 
     if preserve_published:
 
@@ -1197,6 +1201,81 @@ def load_desired_channels(
     return desired
 
 
+def load_control_settings() -> dict:
+    try:
+        payload = json.loads(CHANNELS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    settings = payload.get("settings", {})
+    return settings if isinstance(settings, dict) else {}
+
+
+def configured_utterance_gap() -> float | None:
+    raw = load_control_settings().get("utterance_gap_seconds")
+    if raw in (None, ""):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if 0.5 <= value <= 10 else None
+
+
+def configured_publish_after_idle_minutes() -> float:
+    raw = load_control_settings().get("publish_after_idle_minutes", 0)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    return value if 0 <= value <= 240 else 0.0
+
+
+def load_publish_requests() -> dict[str, str]:
+    try:
+        payload = json.loads(CHANNELS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    requests = {}
+    for entry in payload.get("channels", []):
+        if not isinstance(entry, dict):
+            continue
+        try:
+            channel = normalize_channel(str(entry.get("channel", "")))
+        except ValueError:
+            continue
+        request_id = str(entry.get("publish_request_id", "")).strip()
+        if request_id:
+            requests[channel] = request_id
+    return requests
+
+
+def clear_publish_request(channel: str, publish_request_id: str) -> None:
+    try:
+        payload = json.loads(CHANNELS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    entries = payload.get("channels", [])
+    if not isinstance(entries, list):
+        return
+    changed = False
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            entry_channel = normalize_channel(str(entry.get("channel", "")))
+        except ValueError:
+            continue
+        if (
+            entry_channel == channel
+            and str(entry.get("publish_request_id", "")).strip()
+            == publish_request_id
+        ):
+            entry.pop("publish_request_id", None)
+            changed = True
+    if changed:
+        atomic_write_json(CHANNELS_FILE, payload)
+
+
 # ---------------------------------------------------------
 # Process/data helpers
 # ---------------------------------------------------------
@@ -1227,44 +1306,34 @@ def stop_process(
     child: subprocess.Popen,
     timeout: float = 15.0,
 ) -> None:
-
     if child.poll() is not None:
         return
-
     try:
-
-        os.killpg(
-            child.pid,
-            signal.SIGTERM,
-        )
-
-        child.wait(
-            timeout=timeout
-        )
-
-    except (
-        ProcessLookupError,
-        subprocess.TimeoutExpired,
-    ):
-
+        os.killpg(child.pid, signal.SIGTERM)
+        child.wait(timeout=timeout)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
         try:
-
-            os.killpg(
-                child.pid,
-                signal.SIGKILL,
-            )
-
+            os.killpg(child.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-
         try:
-
-            child.wait(
-                timeout=5
-            )
-
+            child.wait(timeout=5)
         except subprocess.TimeoutExpired:
             pass
+
+
+def finish_process_for_publish(
+    child: subprocess.Popen,
+    timeout: float = 30.0,
+) -> None:
+    """Ask a probe to finalize normally so the worker can publish its output."""
+    if child.poll() is not None:
+        return
+    try:
+        os.killpg(child.pid, signal.SIGINT)
+        child.wait(timeout=timeout)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        return
 
 
 def start_youtube_publish(
@@ -1478,6 +1547,9 @@ def main() -> int:
                 default_channel
             )
         )
+        configured_gap = configured_utterance_gap()
+        idle_publish_minutes = configured_publish_after_idle_minutes()
+        publish_requests = load_publish_requests()
 
         # -------------------------------------------------
         # 登録解除 / request_id変更:
@@ -1492,51 +1564,78 @@ def main() -> int:
                 desired.get(
                     channel
                 )
-                == running[
+                != running[
                     "request_id"
                 ]
             ):
+                print(
+                    f"[control] stopping #{channel}",
+                    flush=True,
+                )
+
+                write_channel_status(
+                    channel,
+                    "stopping",
+                )
+
+                stop_process(
+                    running[
+                        "process"
+                    ]
+                )
+
+                active.pop(
+                    channel,
+                    None,
+                )
+
+                waiting.pop(
+                    channel,
+                    None,
+                )
+
+                completed.pop(
+                    channel,
+                    None,
+                )
+
+                cold_start_requests.pop(
+                    channel,
+                    None,
+                )
+
+                purge_channel_data(
+                    channel
+                )
                 continue
 
-            print(
-                f"[control] stopping #{channel}",
-                flush=True,
-            )
+            if running.get("finishing_for_publish"):
+                continue
 
-            write_channel_status(
-                channel,
-                "stopping",
-            )
+            ranking_file = channel_data_dir(channel) / "highlights.json"
+            try:
+                ranking_mtime_ns = ranking_file.stat().st_mtime_ns
+            except OSError:
+                ranking_mtime_ns = None
+            if ranking_mtime_ns != running.get("ranking_mtime_ns"):
+                running["ranking_mtime_ns"] = ranking_mtime_ns
+                running["last_ranking_activity_at"] = time.monotonic()
 
-            stop_process(
-                running[
-                    "process"
-                ]
+            manual_requested = channel in publish_requests
+            idle_seconds = time.monotonic() - running["last_ranking_activity_at"]
+            idle_reached = (
+                idle_publish_minutes > 0
+                and idle_seconds >= idle_publish_minutes * 60
             )
-
-            active.pop(
-                channel,
-                None,
-            )
-
-            waiting.pop(
-                channel,
-                None,
-            )
-
-            completed.pop(
-                channel,
-                None,
-            )
-
-            cold_start_requests.pop(
-                channel,
-                None,
-            )
-
-            purge_channel_data(
-                channel
-            )
+            if manual_requested or idle_reached:
+                reason = "manual request" if manual_requested else "ranking idle"
+                print(f"[publish] finishing #{channel}: {reason}", flush=True)
+                running["finishing_for_publish"] = True
+                if manual_requested:
+                    clear_publish_request(channel, publish_requests[channel])
+                write_channel_status(channel, "finalizing_for_publish")
+                finish_process_for_publish(running["process"])
+                continue
 
         # -------------------------------------------------
         # 登録解除 / request_id変更:
@@ -1794,6 +1893,7 @@ def main() -> int:
                             "started_at"
                         ]
                     ),
+                    utterance_gap_seconds=configured_gap,
                 )
             )
 
@@ -1814,6 +1914,8 @@ def main() -> int:
             ] = {
                 "request_id": request_id,
                 "process": child,
+                "ranking_mtime_ns": None,
+                "last_ranking_activity_at": time.monotonic(),
             }
 
             write_channel_status(

@@ -206,6 +206,28 @@ class WebTests(unittest.TestCase):
         self.assertEqual(added.status_code, 202)
         self.assertEqual(added.json["channel"], "xhalli4x")
 
+    def test_dashboard_settings_and_manual_publish_are_persisted(self):
+        self.add_channel("yaritaiji")
+        settings = self.client.patch(
+            "/api/settings",
+            json={
+                "utterance_gap_seconds": 3.3,
+                "publish_after_idle_minutes": 12,
+            },
+        )
+        self.assertEqual(settings.status_code, 202)
+        self.assertEqual(
+            self.client.get("/api/settings").json,
+            {
+                "utterance_gap_seconds": 3.3,
+                "publish_after_idle_minutes": 12.0,
+            },
+        )
+        published = self.client.post("/api/channels/yaritaiji/publish")
+        self.assertEqual(published.status_code, 202)
+        stored = json.loads((self.control / "channels.json").read_text())
+        self.assertTrue(stored["channels"][0]["publish_request_id"])
+
     def test_delete_removes_channel(self):
         self.add_channel("yaritaiji")
         deleted = self.client.delete("/api/channels/yaritaiji")
