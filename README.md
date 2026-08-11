@@ -1,6 +1,6 @@
 # Hype Clipper
 
-Twitch配信の`audio_only`とチャットをリアルタイム監視し、VADとチャット密度から盛り上がり上位10件を更新します。映像は常時受信・録画せず、対応するTwitch VODが対象地点まで公開された時点で30秒動画を生成します。
+Twitch配信の`audio_only`とチャットをリアルタイム監視し、VADとチャット密度から盛り上がり上位10件を更新します。映像は常時受信・録画せず、対応するTwitch VODが対象地点まで公開された時点で30〜90秒の可変長動画を生成します。
 
 現在の監視上限は3配信者です。ランキングと動画は配信者ごとに分離され、PCとスマートフォンのWeb UIから切り替えて閲覧できます。YouTubeアップロード機能はありません。
 
@@ -16,11 +16,11 @@ Twitch配信の`audio_only`とチャットをリアルタイム監視し、VAD�
 6. 配信開始からの`offset_seconds`を`highlights.json`へ保存し、動画を待たずランキングを更新
 7. Twitch APIで`stream_id`が一致するアーカイブVODを確認
 8. VODが対象区間まで伸びたら、StreamlinkのHLS開始位置・区間長指定で必要なセグメントだけを取得
-9. 720pを優先して30秒MP4を生成し、Web UIへ反映
+9. 720pを優先して30〜90秒の可変長MP4を生成し、Web UIへ反映
 
 8秒チャンクは、次のチャンクが作られてからVADへ渡します。そのため通常時にディスクへ存在する音声は、処理対象と受信中を合わせて約16秒です。VAD処理が終わったチャンクは直ちに削除し、後の動画生成目的では保存しません。
 
-VOD取得時は先頭から読み進めません。クリップ開始位置の12秒前から約42秒分を指定し、HLSセグメント境界へ丸められた必要範囲だけを取得します。VOD全体はダウンロードしません。
+VOD取得時は先頭から読み進めません。クリップ開始位置の12秒前から可変長クリップに必要な区間を指定し、HLSセグメント境界へ丸められた範囲だけを取得します。VOD全体はダウンロードしません。
 
 ## クリップ開始位置
 
@@ -28,10 +28,12 @@ VOD取得時は先頭から読み進めません。クリップ開始位置の12
 
 既定値:
 
-- クリップ: 30秒
+- 採点窓: 30秒
+- クリップ: 最低30秒、最大90秒
+- 発話終了後の余白: 2秒
 - プリロール: 5秒
 - 1つ前の発話を探す範囲: 20秒
-- 発話を結合する無音間隔: 2.5秒
+- 発話を結合し、動画終了を確定する無音間隔: 2秒
 - VAD音声チャンク: 8秒
 - VOD確認間隔: 60秒
 - 配信終了後のVOD最終確認: 最大15分
@@ -42,6 +44,7 @@ VOD取得時は先頭から読み進めません。クリップ開始位置の12
 
 ランキング候補には次の状態があります。
 
+- `waiting_clip_end`: 発話終了の確定待ち
 - `waiting_vod`: VODの出現または対象区間の反映待ち
 - `generating`: 対象HLS区間から動画を生成中
 - `ready`: Web UIで再生可能
@@ -72,7 +75,7 @@ http://localhost:3000
 配信終了まで監視する基本コマンド:
 
 ```powershell
-.\.venv\Scripts\python.exe -u twitch_auth.py --run-probe --channel yaritaiji --duration-minutes 0 --highlight-seconds 30 --preroll-seconds 5 --utterance-gap-seconds 2.5 --previous-lookback-seconds 20
+.\.venv\Scripts\python.exe -u twitch_auth.py --run-probe --channel yaritaiji --duration-minutes 0 --highlight-seconds 30 --clip-margin-seconds 1 --utterance-gap-seconds 4
 ```
 
 `--duration-minutes 0`または時間指定なしは配信終了まで、正の値を指定するとその分数で終了します。
@@ -110,6 +113,10 @@ TWITCH_CLIENT_ID=...
 TWITCH_CLIENT_SECRET=...
 TWITCH_CHANNEL=yaritaiji
 HIGHLIGHT_SECONDS=30
+CLIP_MIN_SECONDS=30
+CLIP_MAX_SECONDS=140
+CLIP_MARGIN_SECONDS=1
+UTTERANCE_GAP_SECONDS=3.5
 SEGMENT_SECONDS=8
 VOD_POLL_SECONDS=60
 VOD_READY_MARGIN_SECONDS=10

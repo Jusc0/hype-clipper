@@ -121,7 +121,13 @@ def build_youtube_chapters(
             f"{chapter_stamp} {rank}位"
         )
 
-        elapsed += clip_duration_seconds
+        elapsed += float(
+            item.get(
+                "duration_seconds",
+                clip_duration_seconds,
+            )
+            or clip_duration_seconds
+        )
 
     return "\n".join(lines)
 

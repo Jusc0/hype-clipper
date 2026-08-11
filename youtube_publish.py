@@ -55,9 +55,6 @@ def publish_channel(
 
     chapters = build_youtube_chapters(
         highlights,
-        clip_duration_seconds=float(
-            highlights[0].get("duration_seconds", 30.0)
-        ),
     )
 
     stream_date = get_stream_date(highlights)

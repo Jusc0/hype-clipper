@@ -1033,16 +1033,20 @@ def build_probe_command(
             "--highlight-seconds",
         ),
         (
-            "PREROLL_SECONDS",
-            "--preroll-seconds",
+            "CLIP_MIN_SECONDS",
+            "--clip-min-seconds",
+        ),
+        (
+            "CLIP_MAX_SECONDS",
+            "--clip-max-seconds",
+        ),
+        (
+            "CLIP_MARGIN_SECONDS",
+            "--clip-margin-seconds",
         ),
         (
             "UTTERANCE_GAP_SECONDS",
             "--utterance-gap-seconds",
-        ),
-        (
-            "PREVIOUS_LOOKBACK_SECONDS",
-            "--previous-lookback-seconds",
         ),
         (
             "TOP_COUNT",

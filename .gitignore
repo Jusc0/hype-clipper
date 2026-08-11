@@ -18,3 +18,12 @@ data/
 twitch_tokens.json
 token.pickle
 client_secret.json
+
+# Local live/VOD test harnesses and generated captures
+.python311-runtime/
+test_live_vad_tail.py
+test_live_vad_tail.compact.py
+test_vod_vad_tail.py
+compact.py
+compare_end_margin.py
+vad_tail_test*/

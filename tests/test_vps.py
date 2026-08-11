@@ -6,6 +6,7 @@ import unittest
 from unittest import mock
 
 import hype_web
+import highlight_compiler
 import twitch_reaction_probe
 import vod_clip_manager
 import vps_worker
@@ -33,7 +34,10 @@ class WorkerTests(unittest.TestCase):
                     os.environ,
                     {
                         "HIGHLIGHT_SECONDS": "30",
-                        "PREROLL_SECONDS": "5",
+                        "CLIP_MIN_SECONDS": "30",
+                        "CLIP_MAX_SECONDS": "90",
+                        "CLIP_MARGIN_SECONDS": "1",
+                        "UTTERANCE_GAP_SECONDS": "2.5",
                         "TOP_COUNT": "10",
                     },
                     clear=False,
@@ -51,7 +55,14 @@ class WorkerTests(unittest.TestCase):
         self.assertIn("--preserve-published-on-start", command)
         self.assertEqual(command[command.index("--channel") + 1], "yaritaiji")
         self.assertEqual(command[command.index("--highlight-seconds") + 1], "30")
-        self.assertEqual(command[command.index("--preroll-seconds") + 1], "5")
+        self.assertEqual(command[command.index("--clip-min-seconds") + 1], "30")
+        self.assertEqual(command[command.index("--clip-max-seconds") + 1], "90")
+        self.assertEqual(
+            command[command.index("--clip-margin-seconds") + 1], "1"
+        )
+        self.assertEqual(
+            command[command.index("--utterance-gap-seconds") + 1], "2.5"
+        )
         self.assertEqual(command[command.index("--top-count") + 1], "10")
         self.assertEqual(
             command[command.index("--stream-started-at-epoch") + 1],
@@ -190,6 +201,11 @@ class WebTests(unittest.TestCase):
             ["yaritaiji", "shaka", "third_channel"],
         )
 
+    def test_dashboard_accepts_twitch_channel_url(self):
+        added = self.add_channel("https://twitch.tv/xhalli4x")
+        self.assertEqual(added.status_code, 202)
+        self.assertEqual(added.json["channel"], "xhalli4x")
+
     def test_delete_removes_channel(self):
         self.add_channel("yaritaiji")
         deleted = self.client.delete("/api/channels/yaritaiji")
@@ -251,6 +267,40 @@ class WebTests(unittest.TestCase):
 
 
 class RealtimeProbeTests(unittest.TestCase):
+    def test_dynamic_clip_end_waits_for_silence_and_extends_past_minimum(self):
+        speech = [{"offset_start": 28.0, "offset_end": 35.0}]
+        waiting = twitch_reaction_probe.resolve_dynamic_clip_duration(
+            speech, 0.0, 36.0,
+        )
+        ready = twitch_reaction_probe.resolve_dynamic_clip_duration(
+            speech, 0.0, 39.0,
+        )
+        self.assertIsNone(waiting[0])
+        self.assertEqual(waiting[1], "waiting_silence")
+        self.assertEqual(ready, (36.0, "natural", 35.0))
+
+    def test_dynamic_clip_end_uses_minimum_and_hard_maximum(self):
+        minimum = twitch_reaction_probe.resolve_dynamic_clip_duration(
+            [{"offset_start": 5.0, "offset_end": 20.0}],
+            0.0,
+            30.0,
+        )
+        maximum = twitch_reaction_probe.resolve_dynamic_clip_duration(
+            [{"offset_start": 28.0, "offset_end": 95.0}],
+            0.0,
+            90.0,
+            maximum_seconds=90.0,
+        )
+        self.assertEqual(minimum, (30.0, "natural_at_minimum", 20.0))
+        self.assertEqual(maximum, (90.0, "hard_max", 95.0))
+
+    def test_dynamic_clip_end_stays_at_minimum_when_speech_stops_at_minimum(self):
+        speech = [{"offset_start": 28.0, "offset_end": 30.0}]
+        result = twitch_reaction_probe.resolve_dynamic_clip_duration(
+            speech, 0.0, 34.0,
+        )
+        self.assertEqual(result, (30.0, "natural_at_minimum", 30.0))
+
     def test_live_capture_commands_are_audio_only(self):
         streamlink_command = (
             twitch_reaction_probe.build_live_audio_streamlink_command(
@@ -295,16 +345,37 @@ class RealtimeProbeTests(unittest.TestCase):
                 timeline_offset_seconds=100.0,
                 stream_id="stream-123",
                 highlight_seconds=30.0,
-                preroll_seconds=5.0,
-                previous_lookback_seconds=20.0,
+                preroll_seconds=1.0,
             )
             changed = manager.evaluate(60.0)
+            duplicate_changed = manager.evaluate(65.0)
             item = manager.top_non_overlapping(1)[0]
         self.assertTrue(changed)
-        # Peak speech starts at 25s; previous speech starts at 20s; preroll => 15s.
-        self.assertEqual(item["trigger_start"], 15.0)
-        self.assertEqual(item["offset_seconds"], 115.0)
-        self.assertEqual(item["score"], 3)
+        self.assertFalse(duplicate_changed)
+        self.assertEqual(len(manager.candidates), 1)
+        # The 4-second gap is a new utterance: only 1 second preroll applies.
+        self.assertEqual(item["trigger_start"], 24.0)
+        self.assertEqual(item["offset_seconds"], 124.0)
+        self.assertEqual(item["score"], 1)
+
+    def test_non_overlapping_uses_variable_clip_duration(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            manager = twitch_reaction_probe.RealtimeHighlightManager(
+                Path(temporary) / "chat.jsonl",
+                Path(temporary) / "speech.jsonl",
+                1000.0,
+                8,
+                float("inf"),
+                clip_min_seconds=30.0,
+                clip_max_seconds=140.0,
+            )
+            manager.candidates = [
+                {"trigger_start": 0.0, "duration_seconds": 100.0,
+                 "clip_end_status": "ready", "chat_count": 20},
+                {"trigger_start": 30.0, "duration_seconds": 30.0,
+                 "clip_end_status": "ready", "chat_count": 10},
+            ]
+            self.assertEqual(len(manager.top_non_overlapping(10)), 1)
 
     def test_waiting_vod_is_rendered_without_blocking_ranking(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -324,8 +395,87 @@ class RealtimeProbeTests(unittest.TestCase):
         self.assertIn("VODへの反映を待っています。", page)
         self.assertIn('data-start-seconds="115.000"', page)
 
+    def test_waiting_clip_end_is_rendered(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "reactions.html"
+            twitch_reaction_probe.build_html(
+                output,
+                "yaritaiji",
+                [{
+                    "offset_seconds": 115.0,
+                    "chat_count": 20,
+                    "video_status": "waiting_clip_end",
+                    "duration_seconds": 0.0,
+                }],
+            )
+            page = output.read_text(encoding="utf-8")
+        self.assertIn("発話終了の確定を待っています。", page)
+
 
 class VodClipTests(unittest.TestCase):
+    def test_candidate_duration_is_stored_per_highlight(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            manager = vod_clip_manager.VodClipManager(
+                Path(temporary),
+                "yaritaiji",
+                "stream-123",
+                "user-456",
+                "2026-08-09T01:02:03Z",
+                "client",
+                "token",
+                30.0,
+            )
+            rankings = manager.sync([{
+                "candidate_id": "candidate-1",
+                "offset_seconds": 120.0,
+                "duration_seconds": 42.5,
+                "clip_end_status": "ready",
+                "chat_count": 50,
+                "score": 50,
+            }])
+            with mock.patch.object(
+                manager,
+                "_lookup_vod",
+                return_value={
+                    "id": "vod-1",
+                    "url": "https://www.twitch.tv/videos/1",
+                    "duration_seconds": 1000.0,
+                    "match_method": "stream_id",
+                },
+            ), mock.patch.object(
+                vod_clip_manager,
+                "generate_vod_clip",
+                return_value=(True, "", False),
+            ) as generate:
+                manager.process_once()
+        self.assertEqual(rankings[0]["duration_seconds"], 42.5)
+        self.assertEqual(rankings[0]["video_status"], "waiting_vod")
+        self.assertEqual(generate.call_args.args[-1], 42.5)
+
+    def test_unconfirmed_clip_does_not_start_vod_lookup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            manager = vod_clip_manager.VodClipManager(
+                Path(temporary),
+                "yaritaiji",
+                "stream-123",
+                "user-456",
+                "2026-08-09T01:02:03Z",
+                "client",
+                "token",
+                30.0,
+            )
+            manager.sync([{
+                "candidate_id": "candidate-1",
+                "offset_seconds": 120.0,
+                "duration_seconds": 0.0,
+                "clip_end_status": "waiting",
+                "chat_count": 50,
+                "score": 50,
+            }])
+            with mock.patch.object(manager, "_lookup_vod") as lookup:
+                manager.process_once()
+        lookup.assert_not_called()
+
     def test_twitch_duration_and_range_availability(self):
         self.assertEqual(vod_clip_manager.parse_twitch_duration("2h3m4s"), 7384)
         vod = {"duration_seconds": 200.0}
@@ -434,6 +584,19 @@ class VodClipTests(unittest.TestCase):
             ) as lookup:
                 manager._lookup_vod(force=True)
         self.assertEqual(lookup.call_args.args[-1], "fresh-token")
+
+
+class HighlightCompilerTests(unittest.TestCase):
+    def test_youtube_chapters_use_each_variable_clip_duration(self):
+        chapters = highlight_compiler.build_youtube_chapters([
+            {"rank": 1, "duration_seconds": 30.0},
+            {"rank": 2, "duration_seconds": 45.0},
+            {"rank": 3, "duration_seconds": 35.0},
+        ])
+        self.assertEqual(
+            chapters.splitlines(),
+            ["00:00 1位", "00:30 2位", "01:15 3位"],
+        )
 
 
 if __name__ == "__main__":

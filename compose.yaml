@@ -13,9 +13,10 @@ services:
       TWITCH_CHANNEL: ${TWITCH_CHANNEL}
       DURATION_MINUTES: ${DURATION_MINUTES:-0}
       HIGHLIGHT_SECONDS: ${HIGHLIGHT_SECONDS:-30}
-      PREROLL_SECONDS: ${PREROLL_SECONDS:-5}
-      UTTERANCE_GAP_SECONDS: ${UTTERANCE_GAP_SECONDS:-2.5}
-      PREVIOUS_LOOKBACK_SECONDS: ${PREVIOUS_LOOKBACK_SECONDS:-20}
+      CLIP_MIN_SECONDS: ${CLIP_MIN_SECONDS:-30}
+      CLIP_MAX_SECONDS: ${CLIP_MAX_SECONDS:-140}
+      CLIP_MARGIN_SECONDS: ${CLIP_MARGIN_SECONDS:-1}
+      UTTERANCE_GAP_SECONDS: ${UTTERANCE_GAP_SECONDS:-3.5}
       TOP_COUNT: ${TOP_COUNT:-10}
       PREVIEW_INTERVAL_MINUTES: ${PREVIEW_INTERVAL_MINUTES:-1}
       SEGMENT_SECONDS: ${SEGMENT_SECONDS:-8}
@@ -31,7 +32,7 @@ services:
       - hype_auth:/auth
       - hype_control:/control
       - model_cache:/models
-      - /root/record/data:/youtube-auth:ro
+      - /root/record/data:/youtube-auth
     init: true
     restart: unless-stopped
     stop_grace_period: 5m

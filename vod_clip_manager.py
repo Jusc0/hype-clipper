@@ -784,6 +784,24 @@ class VodClipManager(threading.Thread):
 
                 next_ids.append(item_id)
 
+                clip_end_status = str(
+                    candidate.get(
+                        "clip_end_status",
+                        "ready",
+                    )
+                )
+                candidate_duration = float(
+                    candidate.get(
+                        "duration_seconds",
+                        self.duration_seconds,
+                    )
+                    or 0.0
+                )
+                clip_end_ready = (
+                    clip_end_status == "ready"
+                    and candidate_duration > 0
+                )
+
                 entry = self._entries.get(
                     item_id
                 )
@@ -806,7 +824,18 @@ class VodClipManager(threading.Thread):
                                 3,
                             ),
                         "duration_seconds":
-                            self.duration_seconds,
+                            candidate_duration,
+                        "clip_end_status":
+                            clip_end_status,
+                        "clip_end_reason":
+                            candidate.get(
+                                "clip_end_reason",
+                                "",
+                            ),
+                        "clip_last_speech_end":
+                            candidate.get(
+                                "clip_last_speech_end"
+                            ),
                         "score": int(
                             candidate.get(
                                 "score",
@@ -826,7 +855,11 @@ class VodClipManager(threading.Thread):
                                 "",
                             ),
                         "video_status":
-                            "waiting_vod",
+                            (
+                                "waiting_vod"
+                                if clip_end_ready
+                                else "waiting_clip_end"
+                            ),
                         "video_path": "",
                         "vod_id": "",
                         "vod_url": "",
@@ -840,6 +873,39 @@ class VodClipManager(threading.Thread):
                         entry
                     )
 
+                previous_duration = float(
+                    entry.get(
+                        "duration_seconds",
+                        0.0,
+                    )
+                    or 0.0
+                )
+
+                if not clip_end_ready:
+                    entry["video_status"] = (
+                        "waiting_clip_end"
+                    )
+                elif entry.get("video_status") == "waiting_clip_end":
+                    entry["video_status"] = (
+                        "waiting_vod"
+                    )
+                elif (
+                    entry.get("video_status") == "ready"
+                    and abs(previous_duration - candidate_duration) > 0.001
+                ):
+                    old_video = str(
+                        entry.get("video_path", "")
+                    )
+                    if old_video:
+                        try:
+                            (
+                                self.output_dir / old_video
+                            ).unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                    entry["video_status"] = "waiting_vod"
+                    entry["video_path"] = ""
+
                 entry.update(
                     {
                         "rank": rank,
@@ -847,6 +913,19 @@ class VodClipManager(threading.Thread):
                             round(
                                 offset_seconds,
                                 3,
+                            ),
+                        "duration_seconds":
+                            candidate_duration,
+                        "clip_end_status":
+                            clip_end_status,
+                        "clip_end_reason":
+                            candidate.get(
+                                "clip_end_reason",
+                                "",
+                            ),
+                        "clip_last_speech_end":
+                            candidate.get(
+                                "clip_last_speech_end"
                             ),
                         "score": int(
                             candidate.get(
@@ -1056,23 +1135,24 @@ class VodClipManager(threading.Thread):
                 for item_id
                 in self._ranking_ids
                 if (
-                    self._entries[
-                        item_id
-                    ].get(
-                        "video_status"
-                    )
-                    != "ready"
-                    or not (
-                        self.output_dir
-                        / str(
-                            self._entries[
-                                item_id
-                            ].get(
-                                "video_path",
-                                "",
+                    self._entries[item_id].get(
+                        "clip_end_status",
+                        "ready",
+                    ) == "ready"
+                    and (
+                        self._entries[item_id].get(
+                            "video_status"
+                        ) != "ready"
+                        or not (
+                            self.output_dir
+                            / str(
+                                self._entries[item_id].get(
+                                    "video_path",
+                                    "",
+                                )
                             )
-                        )
-                    ).is_file()
+                        ).is_file()
+                    )
                 )
             ]
 
@@ -1162,6 +1242,13 @@ class VodClipManager(threading.Thread):
                 ),
             }
 
+            duration_seconds = float(
+                entry.get(
+                    "duration_seconds",
+                    self.duration_seconds,
+                )
+            )
+
             if not vod_has_range(
                 vod,
                 float(
@@ -1169,7 +1256,7 @@ class VodClipManager(threading.Thread):
                         "offset_seconds"
                     ]
                 ),
-                self.duration_seconds,
+                duration_seconds,
                 self.ready_margin_seconds,
             ):
                 self._update(
@@ -1214,7 +1301,7 @@ class VodClipManager(threading.Thread):
                             "offset_seconds"
                         ]
                     ),
-                    self.duration_seconds,
+                    duration_seconds,
                 )
             )
 
@@ -1270,6 +1357,7 @@ class VodClipManager(threading.Thread):
                     "video_status"
                 )
                 in {
+                    "waiting_clip_end",
                     "waiting_vod",
                     "generating",
                 }

@@ -33,11 +33,13 @@ IRC_PORT = 6697
 LIVE_AUDIO_QUALITY = "audio_only"
 OUTPUT_VIDEO_HEIGHT = 720
 HIGHLIGHT_SECONDS = 30.0
+CLIP_MIN_SECONDS = 30.0
+CLIP_MAX_SECONDS = 140.0
+CLIP_MARGIN_SECONDS = 1.0
+UTTERANCE_GAP_SECONDS = 3.5
 BUFFER_SAFETY_SECONDS = 30.0
 BUFFER_SEGMENT_SAFETY_SECONDS = 10.0
 ROLLING_BUFFER_SECONDS = HIGHLIGHT_SECONDS + BUFFER_SAFETY_SECONDS
-PREVIOUS_UTTERANCE_LOOKBACK_SECONDS = 20.0
-CLIP_PREROLL_SECONDS = 5.0
 TOP_HIGHLIGHT_COUNT = 10
 PREVIEW_INTERVAL_SECONDS = 60.0
 JST = timezone(timedelta(hours=9), "JST")
@@ -380,8 +382,7 @@ def select_chat_window(chats, recording_started_at, window_seconds, recording_se
     return best_start, max(0, best_count)
 
 
-def find_chat_trigger(transcripts, segment_seconds, peak_start, max_lookback=12.0,
-                      previous_lookback_seconds=PREVIOUS_UTTERANCE_LOOKBACK_SECONDS):
+def find_chat_trigger(transcripts, segment_seconds, peak_start, max_lookback=12.0):
     intervals = sorted(
         ((*media_interval(row, segment_seconds), row) for row in transcripts),
         key=lambda item: (item[0], item[1]),
@@ -401,14 +402,10 @@ def find_chat_trigger(transcripts, segment_seconds, peak_start, max_lookback=12.
             return max(0.0, peak_start - 3.0), None
         target = max(preceding, key=lambda item: item[1])
 
+    # SpeechDetector has already merged every utterance chain whose gaps are
+    # at most --utterance-gap-seconds.  Do not apply another lookback here:
+    # it would join distinct utterances separated by a longer silence.
     target_start, _target_end, target_row = target
-    previous = [item for item in intervals if item[1] <= target_start]
-    if previous:
-        previous_start, _previous_end, previous_row = max(
-            previous, key=lambda item: item[1]
-        )
-        if target_start - previous_start <= previous_lookback_seconds:
-            return previous_start, previous_row
     return target_start, target_row
 
 
@@ -429,7 +426,7 @@ def select_top_chat_triggers(transcripts, chats, recording_started_at,
             transcripts, segment_seconds, peak_start
         )
         trigger_start = min(
-            max(0.0, trigger_start - CLIP_PREROLL_SECONDS), max_start
+            max(0.0, trigger_start - CLIP_MARGIN_SECONDS), max_start
         )
         key = round(trigger_start, 3)
         chat_count = count_chats_in_window(
@@ -514,6 +511,91 @@ def create_preview_highlight(source_path, output_path, start_seconds, duration_s
     return True
 
 
+def resolve_dynamic_clip_duration(
+        speech_segments, clip_start, known_offset,
+        minimum_seconds=CLIP_MIN_SECONDS,
+        maximum_seconds=CLIP_MAX_SECONDS,
+        silence_seconds=UTTERANCE_GAP_SECONDS,
+        end_margin_seconds=CLIP_MARGIN_SECONDS):
+    """Return a confirmed clip duration, or None while more audio is needed."""
+    min_end = clip_start + minimum_seconds
+    hard_end = clip_start + maximum_seconds
+    known_offset = max(clip_start, float(known_offset))
+
+    if known_offset < min_end:
+        return None, "waiting_minimum", None
+
+    intervals = sorted(
+        (
+            float(row["offset_start"]),
+            float(row["offset_end"]),
+        )
+        for row in speech_segments
+        if "offset_start" in row and "offset_end" in row
+    )
+    merged = []
+    for start, end in intervals:
+        if not merged or start - merged[-1][1] > silence_seconds:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+
+    active = next(
+        (
+            interval for interval in merged
+            if interval[0] <= min_end <= interval[1]
+        ),
+        None,
+    )
+
+    if active is not None:
+        speech_end = active[1]
+        # 最短地点までに発話が途切れていれば、クリップは最短長で確定。
+        # 30秒地点を越えて発話が続いた場合だけ自然終了へ延長する。
+        if speech_end <= min_end:
+            confirm_at = speech_end + silence_seconds
+            if known_offset < confirm_at:
+                return None, "waiting_silence", speech_end
+            return minimum_seconds, "natural_at_minimum", speech_end
+        if speech_end >= hard_end or speech_end + silence_seconds > hard_end:
+            if known_offset < hard_end:
+                return None, "waiting_hard_max", speech_end
+            return maximum_seconds, "hard_max", speech_end
+
+        clip_end = min(
+            hard_end,
+            max(min_end, speech_end + end_margin_seconds),
+        )
+        confirm_at = max(speech_end + silence_seconds, clip_end)
+        if known_offset < confirm_at:
+            return None, "waiting_silence", speech_end
+        return clip_end - clip_start, "natural", speech_end
+
+    previous = None
+    for interval in merged:
+        if interval[1] <= min_end:
+            previous = interval
+        else:
+            break
+
+    if previous is None:
+        return minimum_seconds, "natural_silence_at_minimum", None
+
+    speech_end = previous[1]
+    clip_end = min(
+        hard_end,
+        max(min_end, speech_end + end_margin_seconds),
+    )
+    confirm_at = max(min_end, speech_end + silence_seconds, clip_end)
+    if confirm_at > hard_end:
+        if known_offset < hard_end:
+            return None, "waiting_hard_max", speech_end
+        return maximum_seconds, "hard_max", speech_end
+    if known_offset < confirm_at:
+        return None, "waiting_silence", speech_end
+    return clip_end - clip_start, "natural_at_minimum", speech_end
+
+
 class RealtimeHighlightManager:
     """Keep the existing VAD/chat ranking logic, but store offsets, not video."""
 
@@ -521,9 +603,13 @@ class RealtimeHighlightManager:
                  segment_seconds, recording_seconds,
                  timeline_offset_seconds=0.0, stream_id="",
                  highlight_seconds=HIGHLIGHT_SECONDS,
-                 preroll_seconds=CLIP_PREROLL_SECONDS,
-                 previous_lookback_seconds=PREVIOUS_UTTERANCE_LOOKBACK_SECONDS,
-                 buffer_seconds=ROLLING_BUFFER_SECONDS, candidate_limit=8):
+                 preroll_seconds=CLIP_MARGIN_SECONDS,
+                 buffer_seconds=ROLLING_BUFFER_SECONDS, candidate_limit=8,
+                 speech_provider=None,
+                 clip_min_seconds=CLIP_MIN_SECONDS,
+                 clip_max_seconds=CLIP_MAX_SECONDS,
+                 clip_end_silence_seconds=UTTERANCE_GAP_SECONDS,
+                 clip_end_margin_seconds=CLIP_MARGIN_SECONDS):
         self.chat_path = chat_path
         self.transcript_path = transcript_path
         self.recording_started_at = recording_started_at
@@ -533,15 +619,74 @@ class RealtimeHighlightManager:
         self.stream_id = stream_id
         self.highlight_seconds = highlight_seconds
         self.preroll_seconds = preroll_seconds
-        self.previous_lookback_seconds = previous_lookback_seconds
         self.buffer_seconds = buffer_seconds
         self.candidate_limit = candidate_limit
+        self.speech_provider = speech_provider
+        self.clip_min_seconds = clip_min_seconds
+        self.clip_max_seconds = clip_max_seconds
+        self.clip_end_silence_seconds = clip_end_silence_seconds
+        self.clip_end_margin_seconds = clip_end_margin_seconds
         self.candidates = []
         self.last_window_end = None
         self.chat_tail = JsonlTail(chat_path)
         self.speech_tail = JsonlTail(transcript_path)
         self.chats = []
         self.speech_segments = []
+
+    def _duration_speech_state(self, current_offset):
+        if self.speech_provider is not None:
+            return self.speech_provider.snapshot()
+        return list(self.speech_segments), current_offset
+
+    def _update_candidate_duration(self, item, current_offset, force=False):
+        rows, known_offset = self._duration_speech_state(current_offset)
+        duration, reason, speech_end = resolve_dynamic_clip_duration(
+            rows,
+            float(item["trigger_start"]),
+            known_offset,
+            minimum_seconds=self.clip_min_seconds,
+            maximum_seconds=self.clip_max_seconds,
+            silence_seconds=self.clip_end_silence_seconds,
+            end_margin_seconds=self.clip_end_margin_seconds,
+        )
+        if duration is None and force:
+            available = min(
+                self.clip_max_seconds,
+                max(0.0, known_offset - float(item["trigger_start"])),
+            )
+            if available >= self.clip_min_seconds:
+                duration = available
+                reason = "capture_end"
+        previous = (
+            item.get("duration_seconds"),
+            item.get("clip_end_status"),
+            item.get("clip_end_reason"),
+            item.get("clip_last_speech_end"),
+        )
+        item["duration_seconds"] = (
+            round(float(duration), 3) if duration is not None else 0.0
+        )
+        item["clip_end_status"] = "ready" if duration is not None else "waiting"
+        item["clip_end_reason"] = reason
+        item["clip_last_speech_end"] = speech_end
+        current = (
+            item["duration_seconds"],
+            item["clip_end_status"],
+            item["clip_end_reason"],
+            item["clip_last_speech_end"],
+        )
+        return current != previous
+
+    def _refresh_candidate_durations(self, current_offset, force=False):
+        changed = False
+        for item in self.candidates:
+            if item.get("clip_end_status") == "ready":
+                continue
+            changed = (
+                self._update_candidate_duration(item, current_offset, force=force)
+                or changed
+            )
+        return changed
 
     def _refresh_events(self, current_offset):
         self.chats.extend(self.chat_tail.read_new())
@@ -555,22 +700,25 @@ class RealtimeHighlightManager:
         ]
 
     def evaluate(self, current_offset, force=False):
+        self._refresh_events(current_offset)
+        duration_changed = self._refresh_candidate_durations(
+            current_offset,
+            force=force,
+        )
         safe_end = current_offset if force else current_offset - 5.0
         if safe_end < self.highlight_seconds:
-            return False
+            return duration_changed
         window_end = safe_end if force else math.floor(safe_end / 5.0) * 5.0
         window_end = min(window_end, self.recording_seconds)
         if self.last_window_end is not None and window_end <= self.last_window_end:
-            return False
+            return duration_changed
         self.last_window_end = window_end
         peak_start = max(0.0, window_end - self.highlight_seconds)
 
-        self._refresh_events(current_offset)
         chats = self.chats
         transcripts = self.speech_segments
         trigger_start, trigger_row = find_chat_trigger(
             transcripts, self.segment_seconds, peak_start,
-            previous_lookback_seconds=self.previous_lookback_seconds,
         )
         trigger_start = min(
             max(0.0, trigger_start - self.preroll_seconds),
@@ -581,29 +729,34 @@ class RealtimeHighlightManager:
             self.highlight_seconds,
         )
 
-        nearby = next(
-            (item for item in self.candidates
-             if abs(item["trigger_start"] - trigger_start) < 20.0),
-            None,
-        )
-        if nearby and chat_count <= nearby["chat_count"]:
-            return False
-        if (not nearby and len(self.candidates) >= self.candidate_limit
-                and chat_count <= min(item["chat_count"] for item in self.candidates)):
-            return False
         offset_seconds = max(
             0.0, trigger_start + self.timeline_offset_seconds
         )
+        item_id = make_candidate_id(self.stream_id, offset_seconds)
+        duplicate = next(
+            (
+                item for item in self.candidates
+                if item["candidate_id"] == item_id
+            ),
+            None,
+        )
+        if duplicate and chat_count <= duplicate["chat_count"]:
+            return duration_changed
+        if duplicate:
+            self.candidates.remove(duplicate)
+
+        if (len(self.candidates) >= self.candidate_limit
+                and chat_count <= min(item["chat_count"] for item in self.candidates)):
+            return duration_changed
         item = {
-            "candidate_id": make_candidate_id(self.stream_id, offset_seconds),
+            "candidate_id": item_id,
             "trigger_start": trigger_start,
             "offset_seconds": offset_seconds,
             "trigger_text": trigger_row.get("text", "") if trigger_row else "",
             "chat_count": chat_count,
             "score": chat_count,
         }
-        if nearby:
-            self.candidates.remove(nearby)
+        self._update_candidate_duration(item, current_offset, force=force)
         self.candidates.append(item)
         while len(self.candidates) > self.candidate_limit:
             loser = min(self.candidates, key=lambda row: row["chat_count"])
@@ -616,14 +769,18 @@ class RealtimeHighlightManager:
 
     def top_non_overlapping(self, limit=TOP_HIGHLIGHT_COUNT):
         selected = []
+        selected_intervals = []
         for item in sorted(self.candidates, key=lambda row: row["chat_count"], reverse=True):
             start = item["trigger_start"]
-            end = start + self.highlight_seconds
-            if any(not (end <= chosen["trigger_start"]
-                           or start >= chosen["trigger_start"] + self.highlight_seconds)
-                   for chosen in selected):
+            duration = float(item.get("duration_seconds") or 0.0)
+            if item.get("clip_end_status") != "ready" or duration <= 0:
+                duration = self.clip_max_seconds
+            end = start + duration
+            if any(not (end <= chosen_start or start >= chosen_end)
+                   for chosen_start, chosen_end in selected_intervals):
                 continue
             selected.append(item)
+            selected_intervals.append((start, end))
             if len(selected) >= limit:
                 break
         return selected
@@ -832,6 +989,9 @@ class SpeechDetector(threading.Thread):
         self.stop_event = stop_event
         self.next_idx = 0
         self.pending = None
+        self.segments = []
+        self.known_offset = 0.0
+        self._state_lock = threading.RLock()
         self.vad_options = VadOptions(
             threshold=0.5,
             min_speech_duration_ms=250,
@@ -840,32 +1000,36 @@ class SpeechDetector(threading.Thread):
         )
 
     def _emit_pending(self):
-        if self.pending is None:
-            return
-        append_jsonl(self.out_path, self.pending)
+        with self._state_lock:
+            if self.pending is None:
+                return
+            row = dict(self.pending)
+            self.pending = None
+            self.segments.append(row)
+        append_jsonl(self.out_path, row)
         print(
-            f"[vad {hhmmss(self.pending['ts_start'])}] speech "
-            f"{self.pending['offset_start']:.2f}-"
-            f"{self.pending['offset_end']:.2f}s"
+            f"[vad {hhmmss(row['ts_start'])}] speech "
+            f"{row['offset_start']:.2f}-"
+            f"{row['offset_end']:.2f}s"
         )
-        self.pending = None
 
     def _add_speech(self, row):
-        if self.pending is None:
+        with self._state_lock:
+            if self.pending is None:
+                self.pending = row
+                return
+            gap = row["offset_start"] - self.pending["offset_end"]
+            if gap <= self.utterance_gap_seconds:
+                self.pending["offset_end"] = max(
+                    self.pending["offset_end"], row["offset_end"]
+                )
+                self.pending["ts_end"] = max(self.pending["ts_end"], row["ts_end"])
+                self.pending["iso_end"] = iso(self.pending["ts_end"])
+                self.pending["end_chunk"] = row["end_chunk"]
+                self.pending["segment_end"] = row["segment_end"]
+                return
+            self._emit_pending()
             self.pending = row
-            return
-        gap = row["offset_start"] - self.pending["offset_end"]
-        if gap <= self.utterance_gap_seconds:
-            self.pending["offset_end"] = max(
-                self.pending["offset_end"], row["offset_end"]
-            )
-            self.pending["ts_end"] = max(self.pending["ts_end"], row["ts_end"])
-            self.pending["iso_end"] = iso(self.pending["ts_end"])
-            self.pending["end_chunk"] = row["end_chunk"]
-            self.pending["segment_end"] = row["segment_end"]
-            return
-        self._emit_pending()
-        self.pending = row
 
     def detect_file(self, wav, idx):
         audio = read_vad_audio(wav)
@@ -890,10 +1054,22 @@ class SpeechDetector(threading.Thread):
                 "segment_end": segment_end,
             })
         known_offset = chunk_offset + len(audio) / 16000.0
-        if (self.pending is not None
+        with self._state_lock:
+            self.known_offset = max(self.known_offset, known_offset)
+            should_emit = (
+                self.pending is not None
                 and known_offset - self.pending["offset_end"]
-                >= self.utterance_gap_seconds):
+                >= self.utterance_gap_seconds
+            )
+        if should_emit:
             self._emit_pending()
+
+    def snapshot(self):
+        with self._state_lock:
+            rows = [dict(row) for row in self.segments]
+            if self.pending is not None:
+                rows.append(dict(self.pending))
+            return rows, self.known_offset
 
     def run(self):
         while not self.stop_event.is_set():
@@ -1049,13 +1225,13 @@ h2 {{ font-size:19px; margin:4px 4px 12px; }}
 
 
 def build_html(output, channel, highlights, duration=HIGHLIGHT_SECONDS,
-               preroll_seconds=CLIP_PREROLL_SECONDS,
-               previous_lookback_seconds=PREVIOUS_UTTERANCE_LOOKBACK_SECONDS,
+               preroll_seconds=CLIP_MARGIN_SECONDS,
                display_limit=TOP_HIGHLIGHT_COUNT, video_prefix="highlight_chat",
                live=False, timeline_offset_seconds=0.0):
     cards = []
     for rank, item in enumerate(highlights, 1):
         video_name = item.get("video_name", f"{video_prefix}_{rank}.mp4")
+        item_duration = float(item.get("duration_seconds") or duration)
         video_html = ""
         video_path = output.parent / video_name
         video_status = item.get("video_status", "ready" if video_path.exists() else "waiting_vod")
@@ -1068,6 +1244,7 @@ def build_html(output, channel, highlights, duration=HIGHLIGHT_SECONDS,
             )
         else:
             status_text = {
+                "waiting_clip_end": "発話終了の確定を待っています。",
                 "waiting_vod": "VODへの反映を待っています。",
                 "generating": "VODから動画を生成中です。",
                 "unavailable": "この配信のVODは利用できません。",
@@ -1089,7 +1266,7 @@ def build_html(output, channel, highlights, duration=HIGHLIGHT_SECONDS,
             f'{video_html}'
             f'<div class="highlight-meta">配信開始から '
             f'{format_elapsed(timeline_start)}〜'
-            f'{format_elapsed(timeline_start + duration)}・'
+            f'{format_elapsed(timeline_start + item_duration)}・'
             f'チャット {item["chat_count"]}件</div>'
             '</section>'
         )
@@ -1218,7 +1395,7 @@ def generate_comparison_outputs(out_dir, channel, recording_started_at,
 
 
 def generate_chat_trigger_output(out_dir, channel, candidates, window_seconds,
-                                 preroll_seconds, previous_lookback_seconds,
+                                 preroll_seconds,
                                  top_count, timeline_offset_seconds=0.0):
     highlights = candidates[:top_count]
     video_results = []
@@ -1229,14 +1406,14 @@ def generate_chat_trigger_output(out_dir, channel, candidates, window_seconds,
         ))
     build_html(
         out_dir / "reactions.html", channel, highlights, window_seconds,
-        preroll_seconds, previous_lookback_seconds, top_count,
+        preroll_seconds, top_count,
         timeline_offset_seconds=timeline_offset_seconds,
     )
     return highlights
 
 
 def generate_live_preview_output(out_dir, channel, candidates, window_seconds,
-                                 preroll_seconds, previous_lookback_seconds,
+                                 preroll_seconds,
                                  top_count, preview_state,
                                  timeline_offset_seconds=0.0):
     highlights = candidates[:top_count]
@@ -1274,7 +1451,7 @@ def generate_live_preview_output(out_dir, channel, candidates, window_seconds,
                 path.unlink()
     build_html(
         out_dir / "reactions.html", channel, display_highlights, window_seconds,
-        preroll_seconds, previous_lookback_seconds, top_count,
+        preroll_seconds, top_count,
         video_prefix="preview_chat", live=True,
         timeline_offset_seconds=timeline_offset_seconds,
     )
@@ -1297,8 +1474,8 @@ def main():
     parser.add_argument(
         "--utterance-gap-seconds",
         type=float,
-        default=2.5,
-        help="merge speech segments separated by this many seconds (default: 2.5)",
+        default=UTTERANCE_GAP_SECONDS,
+        help="merge speech segments separated by this many seconds (default: 3.5)",
     )
     parser.add_argument(
         "--duration-minutes",
@@ -1310,19 +1487,25 @@ def main():
         "--highlight-seconds",
         type=float,
         default=HIGHLIGHT_SECONDS,
-        help="highlight duration in seconds (default: 30)",
+        help="chat ranking window in seconds (default: 30)",
     )
     parser.add_argument(
-        "--preroll-seconds",
+        "--clip-min-seconds",
         type=float,
-        default=CLIP_PREROLL_SECONDS,
-        help="seconds to include before the selected utterance (default: 5)",
+        default=CLIP_MIN_SECONDS,
+        help="minimum output clip length in seconds (default: 30)",
     )
     parser.add_argument(
-        "--previous-lookback-seconds",
+        "--clip-max-seconds",
         type=float,
-        default=PREVIOUS_UTTERANCE_LOOKBACK_SECONDS,
-        help="maximum distance to use the previous utterance (default: 20)",
+        default=CLIP_MAX_SECONDS,
+        help="maximum output clip length in seconds (default: 140)",
+    )
+    parser.add_argument(
+        "--clip-margin-seconds",
+        type=float,
+        default=CLIP_MARGIN_SECONDS,
+        help="seconds before and after the clip speech (default: 1)",
     )
     parser.add_argument(
         "--top-count",
@@ -1382,15 +1565,18 @@ def main():
         args.duration_minutes = None
     if args.highlight_seconds <= 0:
         parser.error("--highlight-seconds must be greater than 0")
+    if args.clip_min_seconds <= 0:
+        parser.error("--clip-min-seconds must be greater than 0")
+    if args.clip_max_seconds < args.clip_min_seconds:
+        parser.error("--clip-max-seconds must be at least --clip-min-seconds")
+    if args.clip_margin_seconds < 0:
+        parser.error("--clip-margin-seconds must be 0 or greater")
     if (args.duration_minutes is not None
-            and args.highlight_seconds > args.duration_minutes * 60):
-        parser.error("--highlight-seconds cannot exceed the recording duration")
+            and max(args.highlight_seconds, args.clip_min_seconds)
+            > args.duration_minutes * 60):
+        parser.error("ranking/minimum clip length cannot exceed recording duration")
     if args.utterance_gap_seconds < 0:
         parser.error("--utterance-gap-seconds must be 0 or greater")
-    if args.preroll_seconds < 0:
-        parser.error("--preroll-seconds must be 0 or greater")
-    if args.previous_lookback_seconds < 0:
-        parser.error("--previous-lookback-seconds must be 0 or greater")
     if args.top_count <= 0:
         parser.error("--top-count must be greater than 0")
     if args.preview_interval_minutes <= 0:
@@ -1477,8 +1663,7 @@ def main():
     if not (args.preserve_published_on_start and html_path.is_file()):
         build_html(
             html_path, args.channel, [], args.highlight_seconds,
-            args.preroll_seconds, args.previous_lookback_seconds,
-            args.top_count, video_prefix="preview_vod", live=True,
+            args.clip_margin_seconds, args.top_count, video_prefix="preview_vod", live=True,
             timeline_offset_seconds=initial_timeline_offset,
         )
 
@@ -1514,8 +1699,11 @@ def main():
             recording_seconds = args.duration_minutes * 60
         buffer_seconds = args.highlight_seconds + max(
             BUFFER_SAFETY_SECONDS,
-            args.previous_lookback_seconds + args.preroll_seconds
-            + BUFFER_SEGMENT_SAFETY_SECONDS,
+            args.clip_margin_seconds + BUFFER_SEGMENT_SAFETY_SECONDS,
+        )
+        speech_detector = SpeechDetector(
+            chunk_dir, speech_path, capture.started_at, args.segment_seconds,
+            args.utterance_gap_seconds, stop_event
         )
         highlight_manager = RealtimeHighlightManager(
             chat_path, speech_path, capture.started_at,
@@ -1523,10 +1711,14 @@ def main():
             timeline_offset_seconds=timeline_offset_seconds,
             stream_id=args.stream_id,
             highlight_seconds=args.highlight_seconds,
-            preroll_seconds=args.preroll_seconds,
-            previous_lookback_seconds=args.previous_lookback_seconds,
+            preroll_seconds=args.clip_margin_seconds,
             buffer_seconds=buffer_seconds,
             candidate_limit=max(30, args.top_count * 3),
+            speech_provider=speech_detector,
+            clip_min_seconds=args.clip_min_seconds,
+            clip_max_seconds=args.clip_max_seconds,
+            clip_end_silence_seconds=args.utterance_gap_seconds,
+            clip_end_margin_seconds=args.clip_margin_seconds,
         )
         stream_started_at = args.stream_started_at
         if not stream_started_at and args.stream_started_at_epoch:
@@ -1541,7 +1733,7 @@ def main():
             stream_started_at,
             os.environ.get("TWITCH_CLIENT_ID", "").strip(),
             token,
-            args.highlight_seconds,
+            args.clip_min_seconds,
             poll_seconds=args.vod_poll_seconds,
             ready_margin_seconds=args.vod_ready_margin_seconds,
         )
@@ -1554,8 +1746,7 @@ def main():
                     args.channel,
                     vod_manager.rankings(),
                     args.highlight_seconds,
-                    args.preroll_seconds,
-                    args.previous_lookback_seconds,
+                    args.clip_margin_seconds,
                     args.top_count,
                     video_prefix="preview_vod",
                     live=True,
@@ -1564,10 +1755,6 @@ def main():
 
         vod_manager.on_change = render_rankings
         vod_manager.start()
-        speech_detector = SpeechDetector(
-            chunk_dir, speech_path, capture.started_at, args.segment_seconds,
-            args.utterance_gap_seconds, stop_event
-        )
         speech_detector.start()
         print("\n=== recording ===")
         if args.duration_minutes is None:
