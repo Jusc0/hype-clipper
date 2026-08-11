@@ -139,7 +139,14 @@ def create_app(
         return settings if isinstance(settings, dict) else {}
 
     def write_entries(entries: list[dict]) -> None:
-        atomic_write_json(channels_file, {"channels": entries})
+        try:
+            payload = json.loads(channels_file.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        payload["channels"] = entries
+        atomic_write_json(channels_file, payload)
 
     def status_payload(channel: str) -> dict:
         status_file = channel_dir(channel) / "service_status.json"

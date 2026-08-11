@@ -669,6 +669,7 @@ class VodClipManager(threading.Thread):
         duration_seconds: float,
         poll_seconds: float = 60.0,
         ready_margin_seconds: float = 10.0,
+        preserve_existing: bool = False,
         on_change=None,
     ):
         super().__init__(daemon=True)
@@ -707,6 +708,32 @@ class VodClipManager(threading.Thread):
         self._vod: dict | None = None
         self._next_vod_lookup = 0.0
         self._legacy_cleaned = False
+        if preserve_existing:
+            self._restore_existing_manifest()
+
+    def _restore_existing_manifest(self) -> None:
+        try:
+            payload = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if str(payload.get("stream_id", "")) != self.stream_id:
+            return
+        highlights = payload.get("highlights", [])
+        if not isinstance(highlights, list):
+            return
+        for item in highlights:
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("candidate_id", "")).strip()
+            if not item_id:
+                continue
+            self._entries[item_id] = dict(item)
+            self._ranking_ids.append(item_id)
+        if self._ranking_ids:
+            print(
+                f"[vod] restored {len(self._ranking_ids)} ranking items",
+                flush=True,
+            )
 
     def _persist_locked(self) -> None:
         atomic_write_json(

@@ -27,6 +27,21 @@ class FakeResponse:
 
 
 class WorkerTests(unittest.TestCase):
+    def test_cold_restart_preserves_existing_ranking_data(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            (output / "highlights.json").write_text("{}", encoding="utf-8")
+            self.assertTrue(
+                vps_worker.should_preserve_channel_output(
+                    output, "request-1", "request-1"
+                )
+            )
+            self.assertFalse(
+                vps_worker.should_preserve_channel_output(
+                    output, "request-1", "request-2"
+                )
+            )
+
     def test_idle_publish_resets_only_for_new_ranking_candidate(self):
         running = {
             "ranking_candidate_ids": {"candidate-1"},
@@ -272,6 +287,25 @@ class WebTests(unittest.TestCase):
         self.assertEqual(published.status_code, 202)
         stored = json.loads((self.control / "channels.json").read_text())
         self.assertTrue(stored["channels"][0]["publish_request_id"])
+        deleted = self.client.delete("/api/channels/yaritaiji")
+        self.assertEqual(deleted.status_code, 202)
+        self.assertEqual(
+            self.client.get("/api/settings").json,
+            {
+                "utterance_gap_seconds": 3.3,
+                "vad_threshold": 0.55,
+                "vad_min_speech_seconds": 0.15,
+                "vad_min_silence_seconds": 0.5,
+                "clip_margin_seconds": 1.2,
+                "gap_preceding_count": 42,
+                "gap_follow_up_count": 42,
+                "tail_gap_seconds": 0.8,
+                "publish_after_idle_minutes": 12.0,
+                "show_decision_details": False,
+            },
+        )
+        self.assertEqual(self.add_channel("shaka").status_code, 202)
+        self.assertEqual(self.client.get("/api/settings").json["vad_threshold"], 0.55)
 
     def test_delete_removes_channel(self):
         self.add_channel("yaritaiji")
@@ -334,6 +368,37 @@ class WebTests(unittest.TestCase):
 
 
 class RealtimeProbeTests(unittest.TestCase):
+    def test_finalized_ranking_candidates_restore_after_restart(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manager = twitch_reaction_probe.RealtimeHighlightManager(
+                root / "chat.jsonl",
+                root / "speech.jsonl",
+                0.0,
+                30.0,
+                1000.0,
+                timeline_offset_seconds=500.0,
+                stream_id="stream-123",
+            )
+            manager.restore_candidates([
+                {
+                    "candidate_id": "candidate-1",
+                    "stream_id": "stream-123",
+                    "offset_seconds": 450.0,
+                    "duration_seconds": 42.0,
+                    "clip_end_status": "ready",
+                    "chat_count": 50,
+                    "score": 50,
+                }
+            ])
+
+        self.assertEqual(len(manager.candidates), 1)
+        self.assertEqual(manager.candidates[0]["trigger_start"], -50.0)
+        self.assertEqual(
+            manager.top_non_overlapping(10)[0]["candidate_id"],
+            "candidate-1",
+        )
+
     def test_vad_threshold_is_loaded_from_live_settings(self):
         with tempfile.TemporaryDirectory() as temporary:
             settings_file = Path(temporary) / "channels.json"
@@ -396,6 +461,38 @@ class RealtimeProbeTests(unittest.TestCase):
         )
         self.assertEqual(result[:3], (35.0, "natural", 34.0))
         self.assertIn("その後の発話間隔未満", result[4])
+
+    def test_end_confirms_both_tail_gap_and_margin_then_keeps_margin(self):
+        speech = [
+            {"offset_start": 5.0, "offset_end": 10.0},
+            {"offset_start": 11.0, "offset_end": 12.0},
+        ]
+        waiting = twitch_reaction_probe.resolve_triggered_clip_duration(
+            speech,
+            0.0,
+            10.0,
+            13.5,
+            minimum_seconds=5.0,
+            maximum_seconds=140.0,
+            first_follow_gap_seconds=3.5,
+            gap_follow_up_count=1,
+            subsequent_gap_seconds=1.0,
+            end_margin_seconds=2.0,
+        )
+        ready = twitch_reaction_probe.resolve_triggered_clip_duration(
+            speech,
+            0.0,
+            10.0,
+            14.0,
+            minimum_seconds=5.0,
+            maximum_seconds=140.0,
+            first_follow_gap_seconds=3.5,
+            gap_follow_up_count=1,
+            subsequent_gap_seconds=1.0,
+            end_margin_seconds=2.0,
+        )
+        self.assertEqual(waiting[1], "waiting_silence")
+        self.assertEqual(ready, (14.0, "natural", 12.0))
 
     def test_dynamic_clip_end_waits_for_silence_and_extends_past_minimum(self):
         speech = [{"offset_start": 28.0, "offset_end": 35.0}]
@@ -758,6 +855,50 @@ class RealtimeProbeTests(unittest.TestCase):
 
 
 class VodClipTests(unittest.TestCase):
+    def test_existing_manifest_and_video_state_restore_after_restart(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = vod_clip_manager.VodClipManager(
+                root,
+                "yaritaiji",
+                "stream-123",
+                "user-456",
+                "2026-08-09T01:02:03Z",
+                "client",
+                "token",
+                30.0,
+            )
+            first.sync([
+                {
+                    "candidate_id": "candidate-1",
+                    "offset_seconds": 120.0,
+                    "duration_seconds": 42.0,
+                    "clip_end_status": "ready",
+                    "chat_count": 50,
+                    "score": 50,
+                }
+            ])
+            first._update(
+                "candidate-1",
+                video_status="ready",
+                video_path="preview_vod_candidate-1.mp4",
+            )
+            restored = vod_clip_manager.VodClipManager(
+                root,
+                "yaritaiji",
+                "stream-123",
+                "user-456",
+                "2026-08-09T01:02:03Z",
+                "client",
+                "token",
+                30.0,
+                preserve_existing=True,
+            )
+
+        self.assertEqual(len(restored.rankings()), 1)
+        self.assertEqual(restored.rankings()[0]["candidate_id"], "candidate-1")
+        self.assertEqual(restored.rankings()[0]["video_status"], "ready")
+
     def test_candidate_duration_is_stored_per_highlight(self):
         with tempfile.TemporaryDirectory() as temporary:
             manager = vod_clip_manager.VodClipManager(

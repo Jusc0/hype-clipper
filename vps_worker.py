@@ -1264,6 +1264,20 @@ def load_ranking_additions(channel: str) -> dict[str, float] | None:
     return additions
 
 
+def should_preserve_channel_output(
+    output_dir: Path,
+    cold_start_request_id: str | None,
+    request_id: str,
+) -> bool:
+    return (
+        cold_start_request_id == request_id
+        and (
+            (output_dir / "reactions.html").is_file()
+            or (output_dir / "highlights.json").is_file()
+        )
+    )
+
+
 def update_ranking_addition_state(
     running: dict,
     additions: dict[str, float] | None,
@@ -1856,15 +1870,10 @@ def main() -> int:
 
             # cold start時に前回完成品があるなら
             # 新しいprobe開始時に維持する
-            preserve_published = (
-                cold_start_requests.get(
-                    channel
-                )
-                == request_id
-                and (
-                    output_dir
-                    / "reactions.html"
-                ).is_file()
+            preserve_published = should_preserve_channel_output(
+                output_dir,
+                cold_start_requests.get(channel),
+                request_id,
             )
 
             # ★重要

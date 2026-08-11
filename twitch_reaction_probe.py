@@ -1067,6 +1067,37 @@ class RealtimeHighlightManager:
                 break
         return selected
 
+    def restore_candidates(self, entries):
+        """Seed finalized candidates retained across a probe restart."""
+        restored = []
+        for entry in entries:
+            try:
+                if str(entry.get("stream_id", "")) != self.stream_id:
+                    continue
+                duration = float(entry.get("duration_seconds", 0) or 0)
+                offset_seconds = float(entry["offset_seconds"])
+                chat_count = int(entry.get("chat_count", entry.get("score", 0)))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if duration <= 0 or entry.get("clip_end_status") != "ready":
+                continue
+            candidate = dict(entry)
+            candidate.update(
+                {
+                    "trigger_start": offset_seconds - self.timeline_offset_seconds,
+                    "offset_seconds": offset_seconds,
+                    "duration_seconds": duration,
+                    "clip_end_status": "ready",
+                    "chat_count": chat_count,
+                    "score": int(entry.get("score", chat_count)),
+                }
+            )
+            restored.append(candidate)
+        restored.sort(key=lambda row: row["chat_count"], reverse=True)
+        self.candidates.extend(restored[:self.candidate_limit])
+        if restored:
+            print(f"[ranking] restored {len(restored)} candidates", flush=True)
+
     def _hard_max_continuations(self, item):
         """Split a still-speaking hard-max clip into consecutive clips.
 
@@ -2274,7 +2305,10 @@ def main():
             args.clip_min_seconds,
             poll_seconds=args.vod_poll_seconds,
             ready_margin_seconds=args.vod_ready_margin_seconds,
+            preserve_existing=args.preserve_published_on_start,
         )
+        if args.preserve_published_on_start:
+            highlight_manager.restore_candidates(vod_manager.rankings())
         render_lock = threading.Lock()
 
         def render_rankings():
