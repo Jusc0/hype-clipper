@@ -646,7 +646,11 @@ class RealtimeHighlightManager:
             known_offset,
             minimum_seconds=self.clip_min_seconds,
             maximum_seconds=self.clip_max_seconds,
-            silence_seconds=self.clip_end_silence_seconds,
+            silence_seconds=(
+                self.speech_provider.current_gap_seconds()
+                if self.speech_provider is not None
+                else self.clip_end_silence_seconds
+            ),
             end_margin_seconds=self.clip_end_margin_seconds,
         )
         if duration is None and force:
@@ -977,15 +981,48 @@ class AudioOnlyCapture:
                         pass
 
 
+class RuntimeSpeechGap:
+    """Read the web-controlled speech gap without restarting a live probe."""
+
+    def __init__(self, settings_file, default):
+        self.path = Path(settings_file) if settings_file else None
+        self.default = float(default)
+        self._mtime_ns = None
+        self._value = self.default
+        self._lock = threading.Lock()
+
+    def value(self):
+        if self.path is None:
+            return self.default
+        try:
+            mtime_ns = self.path.stat().st_mtime_ns
+        except OSError:
+            return self._value
+        with self._lock:
+            if mtime_ns == self._mtime_ns:
+                return self._value
+            self._mtime_ns = mtime_ns
+            try:
+                payload = json.loads(self.path.read_text(encoding="utf-8"))
+                value = float(payload.get("settings", {}).get("utterance_gap_seconds"))
+                if 0.5 <= value <= 10:
+                    self._value = value
+                    print(f"[control] speech gap updated to {value:g}s", flush=True)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pass
+            return self._value
+
+
 class SpeechDetector(threading.Thread):
     def __init__(self, chunk_dir, out_path, audio_started_at, segment_seconds,
-                 utterance_gap_seconds, stop_event):
+                 utterance_gap_seconds, stop_event, runtime_speech_gap=None):
         super().__init__(daemon=True)
         self.chunk_dir = chunk_dir
         self.out_path = out_path
         self.audio_started_at = audio_started_at
         self.segment_seconds = segment_seconds
         self.utterance_gap_seconds = utterance_gap_seconds
+        self.runtime_speech_gap = runtime_speech_gap
         self.stop_event = stop_event
         self.next_idx = 0
         self.pending = None
@@ -1019,7 +1056,7 @@ class SpeechDetector(threading.Thread):
                 self.pending = row
                 return
             gap = row["offset_start"] - self.pending["offset_end"]
-            if gap <= self.utterance_gap_seconds:
+            if gap <= self.current_gap_seconds():
                 self.pending["offset_end"] = max(
                     self.pending["offset_end"], row["offset_end"]
                 )
@@ -1030,6 +1067,11 @@ class SpeechDetector(threading.Thread):
                 return
             self._emit_pending()
             self.pending = row
+
+    def current_gap_seconds(self):
+        if self.runtime_speech_gap is not None:
+            return self.runtime_speech_gap.value()
+        return self.utterance_gap_seconds
 
     def detect_file(self, wav, idx):
         audio = read_vad_audio(wav)
@@ -1059,7 +1101,7 @@ class SpeechDetector(threading.Thread):
             should_emit = (
                 self.pending is not None
                 and known_offset - self.pending["offset_end"]
-                >= self.utterance_gap_seconds
+                >= self.current_gap_seconds()
             )
         if should_emit:
             self._emit_pending()
@@ -1478,6 +1520,11 @@ def main():
         help="merge speech segments separated by this many seconds (default: 3.5)",
     )
     parser.add_argument(
+        "--runtime-settings-file",
+        default="",
+        help="JSON settings file watched for live speech-gap updates",
+    )
+    parser.add_argument(
         "--duration-minutes",
         type=float,
         default=0.0,
@@ -1701,9 +1748,13 @@ def main():
             BUFFER_SAFETY_SECONDS,
             args.clip_margin_seconds + BUFFER_SEGMENT_SAFETY_SECONDS,
         )
+        runtime_speech_gap = RuntimeSpeechGap(
+            args.runtime_settings_file,
+            args.utterance_gap_seconds,
+        )
         speech_detector = SpeechDetector(
             chunk_dir, speech_path, capture.started_at, args.segment_seconds,
-            args.utterance_gap_seconds, stop_event
+            args.utterance_gap_seconds, stop_event, runtime_speech_gap
         )
         highlight_manager = RealtimeHighlightManager(
             chat_path, speech_path, capture.started_at,

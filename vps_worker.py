@@ -970,6 +970,7 @@ def build_probe_command(
     stream_user_id: str = "",
     stream_started_at: str = "",
     utterance_gap_seconds: float | None = None,
+    runtime_settings_file: Path | None = None,
 ) -> list[str]:
 
     output_dir = (
@@ -1083,6 +1084,9 @@ def build_probe_command(
 
     if utterance_gap_seconds is not None:
         command.extend(["--utterance-gap-seconds", f"{float(utterance_gap_seconds):g}"])
+
+    if runtime_settings_file is not None:
+        command.extend(["--runtime-settings-file", str(runtime_settings_file)])
 
     if preserve_published:
 
@@ -1894,6 +1898,7 @@ def main() -> int:
                         ]
                     ),
                     utterance_gap_seconds=configured_gap,
+                    runtime_settings_file=CHANNELS_FILE,
                 )
             )
 
