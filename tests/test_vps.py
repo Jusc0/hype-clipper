@@ -27,6 +27,33 @@ class FakeResponse:
 
 
 class WorkerTests(unittest.TestCase):
+    def test_idle_publish_resets_only_for_new_ranking_candidate(self):
+        running = {
+            "ranking_candidate_ids": {"candidate-1"},
+            "last_ranking_addition_at": 100.0,
+        }
+
+        changed = vps_worker.update_ranking_addition_state(
+            running,
+            {"candidate-1": 200.0},
+        )
+        self.assertFalse(changed)
+        self.assertEqual(running["last_ranking_addition_at"], 100.0)
+
+        changed = vps_worker.update_ranking_addition_state(
+            running,
+            {"candidate-1": 200.0, "candidate-2": 300.0},
+        )
+        self.assertTrue(changed)
+        self.assertEqual(running["last_ranking_addition_at"], 300.0)
+
+        changed = vps_worker.update_ranking_addition_state(
+            running,
+            {"candidate-2": 400.0},
+        )
+        self.assertFalse(changed)
+        self.assertEqual(running["last_ranking_addition_at"], 300.0)
+
     def test_build_probe_command_uses_vps_options(self):
         with tempfile.TemporaryDirectory() as temporary:
             with mock.patch.object(vps_worker, "DATA_DIR", Path(temporary)):
@@ -188,6 +215,8 @@ class WebTests(unittest.TestCase):
         self.assertIn('id="rankings"', page.get_data(as_text=True))
         self.assertIn("ランキング順", page.get_data(as_text=True))
         self.assertIn("新着順", page.get_data(as_text=True))
+        self.assertIn('id="showDecisionInput"', page.get_data(as_text=True))
+        self.assertIn("hide-decision-info", page.get_data(as_text=True))
         self.assertNotIn("結果を消して再収集", page.get_data(as_text=True))
         self.assertNotIn("別タブで開く", page.get_data(as_text=True))
         self.assertEqual(self.add_channel("yaritaiji").status_code, 202)
@@ -212,7 +241,15 @@ class WebTests(unittest.TestCase):
             "/api/settings",
             json={
                 "utterance_gap_seconds": 3.3,
+                "vad_threshold": 0.55,
+                "vad_min_speech_seconds": 0.15,
+                "vad_min_silence_seconds": 0.5,
+                "clip_margin_seconds": 1.2,
+                "gap_preceding_count": 42,
+                "gap_follow_up_count": 42,
+                "tail_gap_seconds": 0.8,
                 "publish_after_idle_minutes": 12,
+                "show_decision_details": False,
             },
         )
         self.assertEqual(settings.status_code, 202)
@@ -220,7 +257,15 @@ class WebTests(unittest.TestCase):
             self.client.get("/api/settings").json,
             {
                 "utterance_gap_seconds": 3.3,
+                "vad_threshold": 0.55,
+                "vad_min_speech_seconds": 0.15,
+                "vad_min_silence_seconds": 0.5,
+                "clip_margin_seconds": 1.2,
+                "gap_preceding_count": 42,
+                "gap_follow_up_count": 42,
+                "tail_gap_seconds": 0.8,
                 "publish_after_idle_minutes": 12.0,
+                "show_decision_details": False,
             },
         )
         published = self.client.post("/api/channels/yaritaiji/publish")
@@ -289,6 +334,69 @@ class WebTests(unittest.TestCase):
 
 
 class RealtimeProbeTests(unittest.TestCase):
+    def test_vad_threshold_is_loaded_from_live_settings(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings_file = Path(temporary) / "channels.json"
+            settings_file.write_text(
+                json.dumps({
+                    "settings": {
+                        "utterance_gap_seconds": 3.5,
+                        "vad_threshold": 0.65,
+                        "vad_min_speech_seconds": 0.2,
+                        "vad_min_silence_seconds": 0.7,
+                        "clip_margin_seconds": 1.5,
+                        "gap_preceding_count": 4,
+                        "gap_follow_up_count": 5,
+                        "tail_gap_seconds": 1.2,
+                    }
+                }),
+                encoding="utf-8",
+            )
+            runtime = twitch_reaction_probe.RuntimeSpeechGap(
+                settings_file, 3.5,
+            )
+            detector = twitch_reaction_probe.SpeechDetector(
+                Path(temporary),
+                Path(temporary) / "speech.jsonl",
+                0.0,
+                30.0,
+                3.5,
+                mock.Mock(),
+                runtime,
+            )
+            self.assertEqual(runtime.vad_threshold(), 0.65)
+            self.assertEqual(runtime.value(), 3.5)
+            self.assertEqual(runtime.vad_min_speech_seconds(), 0.2)
+            self.assertEqual(runtime.vad_min_silence_seconds(), 0.7)
+            self.assertEqual(runtime.clip_margin_seconds(), 1.5)
+            self.assertEqual(runtime.gap_preceding_count(), 4)
+            self.assertEqual(runtime.gap_follow_up_count(), 5)
+            self.assertEqual(runtime.tail_gap_seconds(), 1.2)
+            self.assertEqual(detector.vad_options().threshold, 0.65)
+
+    def test_minimum_boundary_chains_speech_inside_tail_gap(self):
+        result = twitch_reaction_probe.resolve_triggered_clip_duration(
+            [
+                {"offset_start": 5.0, "offset_end": 7.0},
+                {"offset_start": 28.0, "offset_end": 31.0},
+                {"offset_start": 31.6, "offset_end": 34.0},
+                {"offset_start": 35.2, "offset_end": 36.0},
+            ],
+            0.0,
+            7.0,
+            36.0,
+            minimum_seconds=30.0,
+            maximum_seconds=140.0,
+            first_follow_gap_seconds=3.5,
+            gap_follow_up_count=1,
+            subsequent_gap_seconds=1.0,
+            end_margin_seconds=1.0,
+            return_linked_count=True,
+            return_linked_detail=True,
+        )
+        self.assertEqual(result[:3], (35.0, "natural", 34.0))
+        self.assertIn("その後の発話間隔未満", result[4])
+
     def test_dynamic_clip_end_waits_for_silence_and_extends_past_minimum(self):
         speech = [{"offset_start": 28.0, "offset_end": 35.0}]
         waiting = twitch_reaction_probe.resolve_dynamic_clip_duration(
@@ -322,6 +430,147 @@ class RealtimeProbeTests(unittest.TestCase):
             speech, 0.0, 34.0,
         )
         self.assertEqual(result, (30.0, "natural_at_minimum", 30.0))
+
+    def test_clip_end_confirmation_can_be_shorter_than_speech_merge_gap(self):
+        result = twitch_reaction_probe.resolve_dynamic_clip_duration(
+            [{"offset_start": 28.0, "offset_end": 34.0}],
+            0.0,
+            36.0,
+            silence_seconds=1.0,
+            merge_gap_seconds=3.5,
+            end_margin_seconds=1.0,
+        )
+        self.assertEqual(result, (35.0, "natural", 34.0))
+
+    def test_trigger_tail_uses_speech_gap_once_then_one_second(self):
+        result = twitch_reaction_probe.resolve_triggered_clip_duration(
+            [
+                {"offset_start": 13.0, "offset_end": 15.0},
+                {"offset_start": 16.0, "offset_end": 17.0},
+                {"offset_start": 18.5, "offset_end": 20.0},
+            ],
+            0.0,
+            10.0,
+            18.1,
+            minimum_seconds=5.0,
+            maximum_seconds=140.0,
+            first_follow_gap_seconds=3.5,
+            subsequent_gap_seconds=1.0,
+            end_margin_seconds=1.0,
+        )
+        self.assertEqual(result, (16.0, "natural", 15.0))
+
+    def test_trigger_tail_allows_configured_number_of_gap_follow_ups(self):
+        result = twitch_reaction_probe.resolve_triggered_clip_duration(
+            [
+                {"offset_start": 13.0, "offset_end": 15.0},
+                {"offset_start": 18.0, "offset_end": 19.0},
+            ],
+            0.0,
+            10.0,
+            20.1,
+            minimum_seconds=5.0,
+            first_follow_gap_seconds=3.5,
+            gap_follow_up_count=2,
+            subsequent_gap_seconds=1.0,
+            end_margin_seconds=1.0,
+        )
+        self.assertEqual(result, (20.0, "natural", 19.0))
+
+    def test_trigger_tail_does_not_count_vad_fragments_as_follow_ups(self):
+        result = twitch_reaction_probe.resolve_triggered_clip_duration(
+            [
+                {"offset_start": 13.0, "offset_end": 14.0},
+                {"offset_start": 14.4, "offset_end": 15.0},
+                {"offset_start": 17.0, "offset_end": 18.0},
+            ],
+            0.0,
+            10.0,
+            22.0,
+            minimum_seconds=5.0,
+            first_follow_gap_seconds=3.5,
+            gap_follow_up_count=2,
+            subsequent_gap_seconds=1.0,
+            end_margin_seconds=1.0,
+        )
+        self.assertEqual(result, (19.0, "natural", 18.0))
+
+    def test_trigger_tail_zero_follow_ups_preserves_unlimited_speech_gap(self):
+        result = twitch_reaction_probe.resolve_triggered_clip_duration(
+            [
+                {"offset_start": 13.0, "offset_end": 15.0},
+                {"offset_start": 18.0, "offset_end": 19.0},
+                {"offset_start": 22.0, "offset_end": 23.0},
+            ],
+            0.0,
+            10.0,
+            27.0,
+            minimum_seconds=5.0,
+            first_follow_gap_seconds=3.5,
+            gap_follow_up_count=0,
+            subsequent_gap_seconds=1.0,
+            end_margin_seconds=1.0,
+        )
+        self.assertEqual(result, (24.0, "natural", 23.0))
+
+    def test_trigger_tail_requires_strictly_less_than_one_second_after_quota(self):
+        result = twitch_reaction_probe.resolve_triggered_clip_duration(
+            [
+                {"offset_start": 12.0, "offset_end": 13.0},
+                {"offset_start": 14.0, "offset_end": 15.0},
+            ],
+            0.0,
+            10.0,
+            22.0,
+            minimum_seconds=5.0,
+            first_follow_gap_seconds=3.5,
+            gap_follow_up_count=1,
+            subsequent_gap_seconds=1.0,
+            end_margin_seconds=1.0,
+        )
+        self.assertEqual(result, (14.0, "natural", 13.0))
+
+    def test_trigger_tail_never_cuts_through_speech_at_minimum_boundary(self):
+        result = twitch_reaction_probe.resolve_triggered_clip_duration(
+            [
+                {"offset_start": 10.0, "offset_end": 11.0},
+                {"offset_start": 29.0, "offset_end": 35.0},
+            ],
+            0.0,
+            11.0,
+            39.0,
+            minimum_seconds=30.0,
+            first_follow_gap_seconds=3.5,
+            gap_follow_up_count=1,
+            subsequent_gap_seconds=1.0,
+            end_margin_seconds=1.0,
+        )
+        self.assertEqual(result, (36.0, "natural", 35.0))
+
+    def test_trigger_head_limits_gap_connected_preceding_utterances(self):
+        rows = [
+            {"offset_start": 2.0, "offset_end": 3.0},
+            {"offset_start": 5.0, "offset_end": 6.0},
+            {"offset_start": 8.0, "offset_end": 9.0},
+        ]
+        self.assertEqual(
+            twitch_reaction_probe.extend_trigger_start_backward(
+                rows, 8.0, 3.5, 1
+            ),
+            5.0,
+        )
+        self.assertEqual(
+            twitch_reaction_probe.extend_trigger_start_backward(
+                rows, 8.0, 3.5, 2
+            ),
+            2.0,
+        )
+        self.assertEqual(
+            twitch_reaction_probe.extend_trigger_start_backward(
+                rows, 8.0, 3.5, 0
+            ),
+            2.0,
+        )
 
     def test_live_capture_commands_are_audio_only(self):
         streamlink_command = (
@@ -399,6 +648,61 @@ class RealtimeProbeTests(unittest.TestCase):
             ]
             self.assertEqual(len(manager.top_non_overlapping(10)), 1)
 
+    def test_hard_max_clip_keeps_speaking_tail_as_next_highlight(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            manager = twitch_reaction_probe.RealtimeHighlightManager(
+                Path(temporary) / "chat.jsonl",
+                Path(temporary) / "speech.jsonl",
+                1000.0,
+                8,
+                float("inf"),
+                stream_id="stream-123",
+                clip_max_seconds=140.0,
+                clip_end_margin_seconds=1.0,
+            )
+            manager.candidates = [
+                {
+                    "candidate_id": "original",
+                    "trigger_start": 100.0,
+                    "offset_seconds": 100.0,
+                    "duration_seconds": 140.0,
+                    "clip_end_status": "ready",
+                    "clip_end_reason": "hard_max",
+                    "clip_last_speech_end": 302.0,
+                    "chat_count": 20,
+                    "score": 20,
+                }
+            ]
+            highlights = manager.top_non_overlapping(10)
+        self.assertEqual(
+            [(item["trigger_start"], item["duration_seconds"])
+             for item in highlights],
+            [(100.0, 140.0), (240.0, 63.0)],
+        )
+        self.assertEqual(highlights[1]["clip_end_reason"], "hard_max_continuation")
+
+    def test_hard_max_continuation_shorter_than_minimum_is_skipped(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            manager = twitch_reaction_probe.RealtimeHighlightManager(
+                Path(temporary) / "chat.jsonl",
+                Path(temporary) / "speech.jsonl",
+                1000.0,
+                8,
+                float("inf"),
+                clip_min_seconds=30.0,
+                clip_max_seconds=140.0,
+                clip_end_margin_seconds=1.0,
+            )
+            manager.candidates = [{
+                "trigger_start": 100.0,
+                "duration_seconds": 140.0,
+                "clip_end_status": "ready",
+                "clip_end_reason": "hard_max",
+                "clip_last_speech_end": 268.0,
+                "chat_count": 20,
+            }]
+            self.assertEqual(len(manager.top_non_overlapping(10)), 1)
+
     def test_waiting_vod_is_rendered_without_blocking_ranking(self):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "reactions.html"
@@ -409,6 +713,17 @@ class RealtimeProbeTests(unittest.TestCase):
                     {
                         "offset_seconds": 115.0,
                         "chat_count": 20,
+                        "trigger_speech_video_seconds": 4.2,
+                        "linked_preceding_count": 2,
+                        "linked_follow_up_count": 3,
+                        "linked_preceding_reason": "前方上限 2個に到達",
+                        "linked_follow_up_reason": "Speech gap 3.3秒以上の無音",
+                        "decision_speech_gap_seconds": 3.3,
+                        "decision_tail_gap_seconds": 1.0,
+                        "decision_clip_margin_seconds": 1.2,
+                        "decision_vad_threshold": 0.55,
+                        "decision_vad_min_speech_seconds": 0.15,
+                        "decision_vad_min_silence_seconds": 0.5,
                         "video_status": "waiting_vod",
                     }
                 ],
@@ -416,6 +731,14 @@ class RealtimeProbeTests(unittest.TestCase):
             page = output.read_text(encoding="utf-8")
         self.assertIn("VODへの反映を待っています。", page)
         self.assertIn('data-start-seconds="115.000"', page)
+        self.assertIn("00:01:55〜00:02:25・チャット 20件", page)
+        self.assertNotIn("配信開始から", page)
+        self.assertIn("直前の発話: 動画内 4.2秒", page)
+        self.assertIn("連結: 前方 2個／後方 3個", page)
+        self.assertIn("Speech gap 3.3秒・後方間隔 1秒未満・余白 1.2秒", page)
+        self.assertIn("VAD 閾値 0.55・最短発話 0.15秒・最短無音 0.5秒", page)
+        self.assertIn("前方: 前方上限 2個に到達", page)
+        self.assertIn('class="highlight-meta decision-info"', page)
 
     def test_waiting_clip_end_is_rendered(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -472,6 +795,7 @@ class VodClipTests(unittest.TestCase):
                 manager.process_once()
         self.assertEqual(rankings[0]["duration_seconds"], 42.5)
         self.assertEqual(rankings[0]["video_status"], "waiting_vod")
+        self.assertTrue(rankings[0]["ranking_added_at"])
         self.assertEqual(generate.call_args.args[-1], 42.5)
 
     def test_unconfirmed_clip_does_not_start_vod_lookup(self):

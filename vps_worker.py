@@ -1234,6 +1234,56 @@ def configured_publish_after_idle_minutes() -> float:
     return value if 0 <= value <= 240 else 0.0
 
 
+def load_ranking_additions(channel: str) -> dict[str, float] | None:
+    """Return candidate IDs and when they first entered the ranking."""
+    path = channel_data_dir(channel) / "highlights.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        fallback_timestamp = path.stat().st_mtime
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    additions: dict[str, float] = {}
+    highlights = payload.get("highlights", [])
+    if not isinstance(highlights, list):
+        return additions
+    for item in highlights:
+        if not isinstance(item, dict):
+            continue
+        candidate_id = str(item.get("candidate_id", "")).strip()
+        if not candidate_id:
+            continue
+        added_at = item.get("ranking_added_at")
+        try:
+            added_timestamp = datetime.fromisoformat(str(added_at)).timestamp()
+        except (TypeError, ValueError):
+            # Existing manifests predate ranking_added_at. Start their timer
+            # from the last manifest write once, then ignore later rewrites.
+            added_timestamp = fallback_timestamp
+        additions[candidate_id] = added_timestamp
+    return additions
+
+
+def update_ranking_addition_state(
+    running: dict,
+    additions: dict[str, float] | None,
+) -> bool:
+    """Reset the idle timer only when a candidate ID newly enters ranking."""
+    if additions is None:
+        return False
+    previous_ids = set(running.get("ranking_candidate_ids", set()))
+    current_ids = set(additions)
+    new_ids = current_ids - previous_ids
+    running["ranking_candidate_ids"] = current_ids
+    if not new_ids:
+        return False
+    running["last_ranking_addition_at"] = max(
+        additions.get(candidate_id, time.time())
+        for candidate_id in new_ids
+    )
+    return True
+
+
 def load_publish_requests() -> dict[str, str]:
     try:
         payload = json.loads(CHANNELS_FILE.read_text(encoding="utf-8"))
@@ -1616,19 +1666,23 @@ def main() -> int:
             if running.get("finishing_for_publish"):
                 continue
 
-            ranking_file = channel_data_dir(channel) / "highlights.json"
-            try:
-                ranking_mtime_ns = ranking_file.stat().st_mtime_ns
-            except OSError:
-                ranking_mtime_ns = None
-            if ranking_mtime_ns != running.get("ranking_mtime_ns"):
-                running["ranking_mtime_ns"] = ranking_mtime_ns
-                running["last_ranking_activity_at"] = time.monotonic()
+            ranking_additions = load_ranking_additions(channel)
+            if update_ranking_addition_state(running, ranking_additions):
+                print(
+                    f"[publish] new ranking item in #{channel}",
+                    flush=True,
+                )
 
             manual_requested = channel in publish_requests
-            idle_seconds = time.monotonic() - running["last_ranking_activity_at"]
+            last_addition_at = running.get("last_ranking_addition_at")
+            idle_seconds = (
+                time.time() - float(last_addition_at)
+                if last_addition_at is not None
+                else 0.0
+            )
             idle_reached = (
                 idle_publish_minutes > 0
+                and last_addition_at is not None
                 and idle_seconds >= idle_publish_minutes * 60
             )
             if manual_requested or idle_reached:
@@ -1908,6 +1962,8 @@ def main() -> int:
                 request_id=request_id,
             )
 
+            initial_ranking_additions = load_ranking_additions(channel) or {}
+
             child = subprocess.Popen(
                 command,
                 env=child_env,
@@ -1919,8 +1975,12 @@ def main() -> int:
             ] = {
                 "request_id": request_id,
                 "process": child,
-                "ranking_mtime_ns": None,
-                "last_ranking_activity_at": time.monotonic(),
+                "ranking_candidate_ids": set(initial_ranking_additions),
+                "last_ranking_addition_at": (
+                    max(initial_ranking_additions.values())
+                    if initial_ranking_additions
+                    else None
+                ),
             }
 
             write_channel_status(

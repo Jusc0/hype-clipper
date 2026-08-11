@@ -809,6 +809,7 @@ class VodClipManager(threading.Thread):
                 if entry is None:
                     entry = {
                         "candidate_id": item_id,
+                        "ranking_added_at": now_iso_jst(),
                         "streamer": self.channel,
                         "streamer_login":
                             self.channel,
@@ -854,6 +855,46 @@ class VodClipManager(threading.Thread):
                                 "trigger_text",
                                 "",
                             ),
+                        "trigger_speech_video_seconds":
+                            candidate.get(
+                                "trigger_speech_video_seconds"
+                            ),
+                        "linked_preceding_count": int(
+                            candidate.get("linked_preceding_count", 0) or 0
+                        ),
+                        "linked_follow_up_count": int(
+                            candidate.get("linked_follow_up_count", 0) or 0
+                        ),
+                        "linked_preceding_reason": candidate.get(
+                            "linked_preceding_reason", ""
+                        ),
+                        "linked_follow_up_reason": candidate.get(
+                            "linked_follow_up_reason", ""
+                        ),
+                        "decision_speech_gap_seconds": candidate.get(
+                            "decision_speech_gap_seconds"
+                        ),
+                        "decision_tail_gap_seconds": candidate.get(
+                            "decision_tail_gap_seconds"
+                        ),
+                        "decision_clip_margin_seconds": candidate.get(
+                            "decision_clip_margin_seconds"
+                        ),
+                        "decision_vad_threshold": candidate.get(
+                            "decision_vad_threshold"
+                        ),
+                        "decision_vad_min_speech_seconds": candidate.get(
+                            "decision_vad_min_speech_seconds"
+                        ),
+                        "decision_vad_min_silence_seconds": candidate.get(
+                            "decision_vad_min_silence_seconds"
+                        ),
+                        "decision_preceding_limit": candidate.get(
+                            "decision_preceding_limit"
+                        ),
+                        "decision_follow_up_limit": candidate.get(
+                            "decision_follow_up_limit"
+                        ),
                         "video_status":
                             (
                                 "waiting_vod"
@@ -945,6 +986,46 @@ class VodClipManager(threading.Thread):
                                 "trigger_text",
                                 "",
                             ),
+                        "trigger_speech_video_seconds":
+                            candidate.get(
+                                "trigger_speech_video_seconds"
+                            ),
+                        "linked_preceding_count": int(
+                            candidate.get("linked_preceding_count", 0) or 0
+                        ),
+                        "linked_follow_up_count": int(
+                            candidate.get("linked_follow_up_count", 0) or 0
+                        ),
+                        "linked_preceding_reason": candidate.get(
+                            "linked_preceding_reason", ""
+                        ),
+                        "linked_follow_up_reason": candidate.get(
+                            "linked_follow_up_reason", ""
+                        ),
+                        "decision_speech_gap_seconds": candidate.get(
+                            "decision_speech_gap_seconds"
+                        ),
+                        "decision_tail_gap_seconds": candidate.get(
+                            "decision_tail_gap_seconds"
+                        ),
+                        "decision_clip_margin_seconds": candidate.get(
+                            "decision_clip_margin_seconds"
+                        ),
+                        "decision_vad_threshold": candidate.get(
+                            "decision_vad_threshold"
+                        ),
+                        "decision_vad_min_speech_seconds": candidate.get(
+                            "decision_vad_min_speech_seconds"
+                        ),
+                        "decision_vad_min_silence_seconds": candidate.get(
+                            "decision_vad_min_silence_seconds"
+                        ),
+                        "decision_preceding_limit": candidate.get(
+                            "decision_preceding_limit"
+                        ),
+                        "decision_follow_up_limit": candidate.get(
+                            "decision_follow_up_limit"
+                        ),
                     }
                 )
 

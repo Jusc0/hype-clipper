@@ -409,6 +409,44 @@ def find_chat_trigger(transcripts, segment_seconds, peak_start, max_lookback=12.
     return target_start, target_row
 
 
+def extend_trigger_start_backward(
+        speech_segments, trigger_start, gap_seconds, preceding_count,
+        return_linked_count=False, return_linked_detail=False):
+    """Add N preceding utterances; zero preserves unlimited legacy lookback."""
+    intervals = sorted(
+        (
+            float(row["offset_start"]),
+            float(row["offset_end"]),
+        )
+        for row in speech_segments
+        if "offset_start" in row and "offset_end" in row
+    )
+    start = float(trigger_start)
+    included = 0
+    reason = "前方に連結対象なし"
+    for previous_start, previous_end in reversed(intervals):
+        if previous_end > start + 0.001:
+            continue
+        if start - previous_end > gap_seconds:
+            reason = f"Speech gap {gap_seconds:g}秒を超過"
+            break
+        start = previous_start
+        included += 1
+        # The setting counts utterances *before* the trigger.  Zero retains
+        # the previous unlimited behaviour.
+        if preceding_count > 0 and included >= preceding_count:
+            reason = f"前方上限 {preceding_count}個に到達"
+            break
+    else:
+        if included:
+            reason = "連結できる前方発話の先頭"
+    if return_linked_detail:
+        return start, included, reason
+    if return_linked_count:
+        return start, included
+    return start
+
+
 def count_chats_in_window(chats, recording_started_at, start, duration):
     end = start + duration
     return sum(start <= row["ts"] - recording_started_at <= end for row in chats)
@@ -516,6 +554,8 @@ def resolve_dynamic_clip_duration(
         minimum_seconds=CLIP_MIN_SECONDS,
         maximum_seconds=CLIP_MAX_SECONDS,
         silence_seconds=UTTERANCE_GAP_SECONDS,
+        merge_gap_seconds=None,
+        confirmation_silence_seconds=None,
         end_margin_seconds=CLIP_MARGIN_SECONDS):
     """Return a confirmed clip duration, or None while more audio is needed."""
     min_end = clip_start + minimum_seconds
@@ -533,9 +573,17 @@ def resolve_dynamic_clip_duration(
         for row in speech_segments
         if "offset_start" in row and "offset_end" in row
     )
+    merge_gap_seconds = (
+        silence_seconds if merge_gap_seconds is None else merge_gap_seconds
+    )
+    confirmation_silence_seconds = (
+        silence_seconds
+        if confirmation_silence_seconds is None
+        else confirmation_silence_seconds
+    )
     merged = []
     for start, end in intervals:
-        if not merged or start - merged[-1][1] > silence_seconds:
+        if not merged or start - merged[-1][1] > merge_gap_seconds:
             merged.append([start, end])
         else:
             merged[-1][1] = max(merged[-1][1], end)
@@ -553,11 +601,14 @@ def resolve_dynamic_clip_duration(
         # 最短地点までに発話が途切れていれば、クリップは最短長で確定。
         # 30秒地点を越えて発話が続いた場合だけ自然終了へ延長する。
         if speech_end <= min_end:
-            confirm_at = speech_end + silence_seconds
+            confirm_at = speech_end + confirmation_silence_seconds
             if known_offset < confirm_at:
                 return None, "waiting_silence", speech_end
             return minimum_seconds, "natural_at_minimum", speech_end
-        if speech_end >= hard_end or speech_end + silence_seconds > hard_end:
+        if (
+            speech_end >= hard_end
+            or speech_end + confirmation_silence_seconds > hard_end
+        ):
             if known_offset < hard_end:
                 return None, "waiting_hard_max", speech_end
             return maximum_seconds, "hard_max", speech_end
@@ -566,7 +617,10 @@ def resolve_dynamic_clip_duration(
             hard_end,
             max(min_end, speech_end + end_margin_seconds),
         )
-        confirm_at = max(speech_end + silence_seconds, clip_end)
+        confirm_at = max(
+            speech_end + confirmation_silence_seconds,
+            clip_end,
+        )
         if known_offset < confirm_at:
             return None, "waiting_silence", speech_end
         return clip_end - clip_start, "natural", speech_end
@@ -586,7 +640,11 @@ def resolve_dynamic_clip_duration(
         hard_end,
         max(min_end, speech_end + end_margin_seconds),
     )
-    confirm_at = max(min_end, speech_end + silence_seconds, clip_end)
+    confirm_at = max(
+        min_end,
+        speech_end + confirmation_silence_seconds,
+        clip_end,
+    )
     if confirm_at > hard_end:
         if known_offset < hard_end:
             return None, "waiting_hard_max", speech_end
@@ -594,6 +652,132 @@ def resolve_dynamic_clip_duration(
     if known_offset < confirm_at:
         return None, "waiting_silence", speech_end
     return clip_end - clip_start, "natural_at_minimum", speech_end
+
+
+def resolve_triggered_clip_duration(
+        speech_segments, clip_start, trigger_speech_end, known_offset,
+        minimum_seconds=CLIP_MIN_SECONDS,
+        maximum_seconds=CLIP_MAX_SECONDS,
+        first_follow_gap_seconds=UTTERANCE_GAP_SECONDS,
+        gap_follow_up_count=1,
+        subsequent_gap_seconds=1.0,
+        end_margin_seconds=CLIP_MARGIN_SECONDS,
+        return_linked_count=False, return_linked_detail=False):
+    """End a hype clip after one long-gap follow-up, then one-second gaps.
+
+    A follow-up is a whole utterance, not a raw VAD fragment.  Fragments that
+    are separated by less than the tail gap stay within the current utterance
+    and do not consume the follow-up count.  A follow-up count of zero
+    preserves the legacy behaviour: every following utterance may start within
+    the configured speech gap.
+    """
+    min_end = clip_start + minimum_seconds
+    hard_end = clip_start + maximum_seconds
+    known_offset = max(clip_start, float(known_offset))
+    gap_follow_ups_seen = 0
+    tail_reason = "後続発話なし"
+
+    def outcome(duration, reason, speech_end):
+        detail = tail_reason
+        if reason == "hard_max":
+            detail = f"動画上限 {maximum_seconds:g}秒に到達"
+        if return_linked_count:
+            if return_linked_detail:
+                return duration, reason, speech_end, gap_follow_ups_seen, detail
+            return duration, reason, speech_end, gap_follow_ups_seen
+        return duration, reason, speech_end
+
+    if known_offset < min_end:
+        return outcome(None, "waiting_minimum", trigger_speech_end)
+
+    intervals = sorted(
+        (
+            float(row["offset_start"]),
+            float(row["offset_end"]),
+        )
+        for row in speech_segments
+        if "offset_start" in row and "offset_end" in row
+    )
+    speech_end = float(trigger_speech_end)
+    for start, end in intervals:
+        if end <= speech_end + 0.001:
+            continue
+        gap = start - speech_end
+        # This is still the current utterance; VAD may split a spoken sentence
+        # into several rows, but those rows must not consume the count.
+        if gap < subsequent_gap_seconds:
+            speech_end = max(speech_end, end)
+            continue
+
+        # A pause at least as long as the tail gap starts another utterance.
+        # It may use Speech gap while the configured number remains.
+        if (gap_follow_up_count > 0
+                and gap_follow_ups_seen >= gap_follow_up_count):
+            tail_reason = (
+                f"後続上限 {gap_follow_up_count}個の後、"
+                f"{subsequent_gap_seconds:g}秒以上の無音"
+            )
+            break
+        if gap >= first_follow_gap_seconds:
+            tail_reason = f"Speech gap {first_follow_gap_seconds:g}秒以上の無音"
+            break
+        speech_end = max(speech_end, end)
+        gap_follow_ups_seen += 1
+        tail_reason = "後続発話を連結中"
+
+    decision_gap = (
+        first_follow_gap_seconds
+        if gap_follow_up_count == 0 or gap_follow_ups_seen < gap_follow_up_count
+        else subsequent_gap_seconds
+    )
+    if speech_end >= hard_end or speech_end + decision_gap > hard_end:
+        if known_offset < hard_end:
+            return outcome(None, "waiting_hard_max", speech_end)
+        return outcome(maximum_seconds, "hard_max", speech_end)
+
+    clip_end = min(hard_end, max(min_end, speech_end + end_margin_seconds))
+    # The minimum duration can reach into a later, unrelated speech block.
+    # Never cut the rendered video in the middle of a VAD-detected utterance:
+    # extend that boundary utterance to its end and preserve the end margin.
+    boundary_speech_end = max(
+        (
+            end for start, end in intervals
+            if start < clip_end and end >= clip_end
+        ),
+        default=None,
+    )
+    if boundary_speech_end is not None:
+        speech_end = max(speech_end, boundary_speech_end)
+        # Once the minimum-duration boundary lands inside speech, keep
+        # chaining later speech while its pause is shorter than the dedicated
+        # post-boundary interval. This avoids ending in the middle of a phrase
+        # split into multiple VAD utterances around the 30-second mark.
+        for start, end in intervals:
+            if end <= speech_end + 0.001:
+                continue
+            if start - speech_end >= subsequent_gap_seconds:
+                break
+            speech_end = max(speech_end, end)
+        decision_gap = subsequent_gap_seconds
+        if speech_end >= hard_end or speech_end + decision_gap > hard_end:
+            if known_offset < hard_end:
+                return outcome(None, "waiting_hard_max", speech_end)
+            return outcome(maximum_seconds, "hard_max", speech_end)
+        clip_end = min(
+            hard_end,
+            max(clip_end, boundary_speech_end + end_margin_seconds),
+        )
+        clip_end = min(
+            hard_end,
+            max(clip_end, speech_end + end_margin_seconds),
+        )
+        tail_reason = (
+            "最短尺の終端に発話が重なり、その後の発話間隔未満を連結"
+        )
+    confirm_at = max(clip_end, speech_end + decision_gap)
+    if known_offset < confirm_at:
+        return outcome(None, "waiting_silence", speech_end)
+    return outcome(clip_end - clip_start, "natural", speech_end)
 
 
 class RealtimeHighlightManager:
@@ -608,7 +792,7 @@ class RealtimeHighlightManager:
                  speech_provider=None,
                  clip_min_seconds=CLIP_MIN_SECONDS,
                  clip_max_seconds=CLIP_MAX_SECONDS,
-                 clip_end_silence_seconds=UTTERANCE_GAP_SECONDS,
+                 clip_end_silence_seconds=1.0,
                  clip_end_margin_seconds=CLIP_MARGIN_SECONDS):
         self.chat_path = chat_path
         self.transcript_path = transcript_path
@@ -640,19 +824,40 @@ class RealtimeHighlightManager:
 
     def _update_candidate_duration(self, item, current_offset, force=False):
         rows, known_offset = self._duration_speech_state(current_offset)
-        duration, reason, speech_end = resolve_dynamic_clip_duration(
-            rows,
-            float(item["trigger_start"]),
-            known_offset,
-            minimum_seconds=self.clip_min_seconds,
-            maximum_seconds=self.clip_max_seconds,
-            silence_seconds=(
-                self.speech_provider.current_gap_seconds()
-                if self.speech_provider is not None
-                else self.clip_end_silence_seconds
-            ),
-            end_margin_seconds=self.clip_end_margin_seconds,
-        )
+        if (
+            self.speech_provider is not None
+            and item.get("trigger_speech_end") is not None
+        ):
+            raw_rows, known_offset = self.speech_provider.raw_snapshot()
+            clip_margin_seconds = self.speech_provider.clip_margin_seconds()
+            (duration, reason, speech_end, linked_follow_up_count,
+             linked_follow_up_reason) = resolve_triggered_clip_duration(
+                raw_rows,
+                float(item["trigger_start"]),
+                float(item["trigger_speech_end"]),
+                known_offset,
+                minimum_seconds=self.clip_min_seconds,
+                maximum_seconds=self.clip_max_seconds,
+                first_follow_gap_seconds=self.speech_provider.current_gap_seconds(),
+                gap_follow_up_count=self.speech_provider.gap_follow_up_count(),
+                subsequent_gap_seconds=self.speech_provider.tail_gap_seconds(),
+                end_margin_seconds=clip_margin_seconds,
+                return_linked_count=True,
+                return_linked_detail=True,
+            )
+        else:
+            clip_margin_seconds = self.clip_end_margin_seconds
+            duration, reason, speech_end = resolve_dynamic_clip_duration(
+                rows,
+                float(item["trigger_start"]),
+                known_offset,
+                minimum_seconds=self.clip_min_seconds,
+                maximum_seconds=self.clip_max_seconds,
+                silence_seconds=self.clip_end_silence_seconds,
+                end_margin_seconds=clip_margin_seconds,
+            )
+            linked_follow_up_count = 0
+            linked_follow_up_reason = "音声発話の連結情報なし"
         if duration is None and force:
             available = min(
                 self.clip_max_seconds,
@@ -666,6 +871,9 @@ class RealtimeHighlightManager:
             item.get("clip_end_status"),
             item.get("clip_end_reason"),
             item.get("clip_last_speech_end"),
+            item.get("linked_follow_up_count"),
+            item.get("linked_follow_up_reason"),
+            item.get("decision_clip_margin_seconds"),
         )
         item["duration_seconds"] = (
             round(float(duration), 3) if duration is not None else 0.0
@@ -673,11 +881,17 @@ class RealtimeHighlightManager:
         item["clip_end_status"] = "ready" if duration is not None else "waiting"
         item["clip_end_reason"] = reason
         item["clip_last_speech_end"] = speech_end
+        item["linked_follow_up_count"] = linked_follow_up_count
+        item["linked_follow_up_reason"] = linked_follow_up_reason
+        item["decision_clip_margin_seconds"] = clip_margin_seconds
         current = (
             item["duration_seconds"],
             item["clip_end_status"],
             item["clip_end_reason"],
             item["clip_last_speech_end"],
+            item["linked_follow_up_count"],
+            item["linked_follow_up_reason"],
+            item["decision_clip_margin_seconds"],
         )
         return current != previous
 
@@ -724,8 +938,55 @@ class RealtimeHighlightManager:
         trigger_start, trigger_row = find_chat_trigger(
             transcripts, self.segment_seconds, peak_start,
         )
+        trigger_speech_end = (
+            media_interval(trigger_row, self.segment_seconds)[1]
+            if trigger_row is not None
+            else None
+        )
+        trigger_speech_start = trigger_start
+        linked_preceding_count = 0
+        linked_preceding_reason = "前方に連結対象なし"
+        decision_speech_gap_seconds = self.clip_end_silence_seconds
+        decision_tail_gap_seconds = self.clip_end_silence_seconds
+        decision_preceding_limit = 0
+        decision_follow_up_limit = 0
+        clip_margin_seconds = self.preroll_seconds
+        decision_vad_threshold = 0.5
+        decision_vad_min_speech_seconds = 0.15
+        decision_vad_min_silence_seconds = 0.5
+        if self.speech_provider is not None:
+            raw_rows, _ = self.speech_provider.raw_snapshot()
+            decision_speech_gap_seconds = self.speech_provider.current_gap_seconds()
+            decision_tail_gap_seconds = self.speech_provider.tail_gap_seconds()
+            decision_preceding_limit = self.speech_provider.gap_preceding_count()
+            decision_follow_up_limit = self.speech_provider.gap_follow_up_count()
+            clip_margin_seconds = self.speech_provider.clip_margin_seconds()
+            decision_vad_threshold = self.speech_provider.vad_threshold()
+            decision_vad_min_speech_seconds = (
+                self.speech_provider.vad_min_speech_seconds()
+            )
+            decision_vad_min_silence_seconds = (
+                self.speech_provider.vad_min_silence_seconds()
+            )
+            raw_trigger_start, raw_trigger_row = find_chat_trigger(
+                raw_rows, self.segment_seconds, peak_start,
+            )
+            if raw_trigger_row is not None:
+                trigger_speech_start = raw_trigger_start
+                (trigger_start, linked_preceding_count,
+                 linked_preceding_reason) = extend_trigger_start_backward(
+                    raw_rows,
+                    raw_trigger_start,
+                    decision_speech_gap_seconds,
+                    decision_preceding_limit,
+                    return_linked_detail=True,
+                )
+                trigger_speech_end = media_interval(
+                    raw_trigger_row,
+                    self.segment_seconds,
+                )[1]
         trigger_start = min(
-            max(0.0, trigger_start - self.preroll_seconds),
+            max(0.0, trigger_start - clip_margin_seconds),
             max(0.0, self.recording_seconds - self.highlight_seconds),
         )
         chat_count = count_chats_in_window(
@@ -757,6 +1018,20 @@ class RealtimeHighlightManager:
             "trigger_start": trigger_start,
             "offset_seconds": offset_seconds,
             "trigger_text": trigger_row.get("text", "") if trigger_row else "",
+            "trigger_speech_video_seconds": round(
+                max(0.0, trigger_speech_start - trigger_start), 3
+            ),
+            "linked_preceding_count": linked_preceding_count,
+            "linked_preceding_reason": linked_preceding_reason,
+            "decision_speech_gap_seconds": decision_speech_gap_seconds,
+            "decision_tail_gap_seconds": decision_tail_gap_seconds,
+            "decision_clip_margin_seconds": clip_margin_seconds,
+            "decision_preceding_limit": decision_preceding_limit,
+            "decision_follow_up_limit": decision_follow_up_limit,
+            "decision_vad_threshold": decision_vad_threshold,
+            "decision_vad_min_speech_seconds": decision_vad_min_speech_seconds,
+            "decision_vad_min_silence_seconds": decision_vad_min_silence_seconds,
+            "trigger_speech_end": trigger_speech_end,
             "chat_count": chat_count,
             "score": chat_count,
         }
@@ -774,7 +1049,10 @@ class RealtimeHighlightManager:
     def top_non_overlapping(self, limit=TOP_HIGHLIGHT_COUNT):
         selected = []
         selected_intervals = []
+        ranked = []
         for item in sorted(self.candidates, key=lambda row: row["chat_count"], reverse=True):
+            ranked.extend(self._hard_max_continuations(item))
+        for item in ranked:
             start = item["trigger_start"]
             duration = float(item.get("duration_seconds") or 0.0)
             if item.get("clip_end_status") != "ready" or duration <= 0:
@@ -788,6 +1066,58 @@ class RealtimeHighlightManager:
             if len(selected) >= limit:
                 break
         return selected
+
+    def _hard_max_continuations(self, item):
+        """Split a still-speaking hard-max clip into consecutive clips.
+
+        A long uninterrupted utterance must not lose its tail merely because
+        the first highlight reached the social-video length cap.
+        """
+        parts = [item]
+        if (
+            item.get("clip_end_status") != "ready"
+            or item.get("clip_end_reason") != "hard_max"
+        ):
+            return parts
+        try:
+            start = float(item["trigger_start"])
+            duration = float(item["duration_seconds"])
+            speech_end = float(item["clip_last_speech_end"])
+        except (KeyError, TypeError, ValueError):
+            return parts
+        if duration <= 0 or speech_end <= start + duration:
+            return parts
+
+        continuation_start = start + duration
+        clip_margin_seconds = self.clip_end_margin_seconds
+        if self.speech_provider is not None:
+            clip_margin_seconds = self.speech_provider.clip_margin_seconds()
+        final_end = speech_end + clip_margin_seconds
+        while continuation_start < final_end - 0.001:
+            continuation_duration = min(
+                self.clip_max_seconds,
+                final_end - continuation_start,
+            )
+            if continuation_duration < self.clip_min_seconds:
+                break
+            offset_seconds = continuation_start + self.timeline_offset_seconds
+            continuation = dict(item)
+            continuation.update(
+                {
+                    "candidate_id": make_candidate_id(
+                        self.stream_id,
+                        offset_seconds,
+                    ),
+                    "trigger_start": continuation_start,
+                    "offset_seconds": offset_seconds,
+                    "duration_seconds": round(continuation_duration, 3),
+                    "clip_end_reason": "hard_max_continuation",
+                    "continuation_of": item.get("candidate_id", ""),
+                }
+            )
+            parts.append(continuation)
+            continuation_start += continuation_duration
+        return parts
 
 
 def parse_irc_tags(raw):
@@ -989,6 +1319,13 @@ class RuntimeSpeechGap:
         self.default = float(default)
         self._mtime_ns = None
         self._value = self.default
+        self._gap_follow_up_count = 1
+        self._gap_preceding_count = 0
+        self._tail_gap_seconds = 1.0
+        self._vad_threshold = 0.5
+        self._vad_min_speech_seconds = 0.15
+        self._vad_min_silence_seconds = 0.5
+        self._clip_margin_seconds = 1.0
         self._lock = threading.Lock()
 
     def value(self):
@@ -1008,9 +1345,72 @@ class RuntimeSpeechGap:
                 if 0.5 <= value <= 10:
                     self._value = value
                     print(f"[control] speech gap updated to {value:g}s", flush=True)
+                follow_up_count = int(
+                    payload.get("settings", {}).get("gap_follow_up_count", 1)
+                )
+                if 0 <= follow_up_count <= 100:
+                    self._gap_follow_up_count = follow_up_count
+                preceding_count = int(
+                    payload.get("settings", {}).get("gap_preceding_count", 0)
+                )
+                if 0 <= preceding_count <= 100:
+                    self._gap_preceding_count = preceding_count
+                tail_gap_seconds = float(
+                    payload.get("settings", {}).get("tail_gap_seconds", 1)
+                )
+                if 0.1 <= tail_gap_seconds <= 10:
+                    self._tail_gap_seconds = tail_gap_seconds
+                vad_threshold = float(
+                    payload.get("settings", {}).get("vad_threshold", 0.5)
+                )
+                if 0.1 <= vad_threshold <= 0.9:
+                    self._vad_threshold = vad_threshold
+                vad_min_speech_seconds = float(
+                    payload.get("settings", {}).get("vad_min_speech_seconds", 0.15)
+                )
+                if 0.05 <= vad_min_speech_seconds <= 2:
+                    self._vad_min_speech_seconds = vad_min_speech_seconds
+                vad_min_silence_seconds = float(
+                    payload.get("settings", {}).get("vad_min_silence_seconds", 0.5)
+                )
+                if 0.1 <= vad_min_silence_seconds <= 3:
+                    self._vad_min_silence_seconds = vad_min_silence_seconds
+                clip_margin_seconds = float(
+                    payload.get("settings", {}).get("clip_margin_seconds", 1)
+                )
+                if 0 <= clip_margin_seconds <= 10:
+                    self._clip_margin_seconds = clip_margin_seconds
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 pass
             return self._value
+
+    def gap_follow_up_count(self):
+        self.value()
+        return self._gap_follow_up_count
+
+    def gap_preceding_count(self):
+        self.value()
+        return self._gap_preceding_count
+
+    def tail_gap_seconds(self):
+        self.value()
+        return self._tail_gap_seconds
+
+    def vad_min_speech_seconds(self):
+        self.value()
+        return self._vad_min_speech_seconds
+
+    def vad_threshold(self):
+        self.value()
+        return self._vad_threshold
+
+    def vad_min_silence_seconds(self):
+        self.value()
+        return self._vad_min_silence_seconds
+
+    def clip_margin_seconds(self):
+        self.value()
+        return self._clip_margin_seconds
 
 
 class SpeechDetector(threading.Thread):
@@ -1027,14 +1427,9 @@ class SpeechDetector(threading.Thread):
         self.next_idx = 0
         self.pending = None
         self.segments = []
+        self.raw_segments = []
         self.known_offset = 0.0
         self._state_lock = threading.RLock()
-        self.vad_options = VadOptions(
-            threshold=0.5,
-            min_speech_duration_ms=250,
-            min_silence_duration_ms=300,
-            speech_pad_ms=150,
-        )
 
     def _emit_pending(self):
         with self._state_lock:
@@ -1052,6 +1447,7 @@ class SpeechDetector(threading.Thread):
 
     def _add_speech(self, row):
         with self._state_lock:
+            self.raw_segments.append(dict(row))
             if self.pending is None:
                 self.pending = row
                 return
@@ -1073,12 +1469,55 @@ class SpeechDetector(threading.Thread):
             return self.runtime_speech_gap.value()
         return self.utterance_gap_seconds
 
+    def gap_follow_up_count(self):
+        if self.runtime_speech_gap is not None:
+            return self.runtime_speech_gap.gap_follow_up_count()
+        return 1
+
+    def gap_preceding_count(self):
+        if self.runtime_speech_gap is not None:
+            return self.runtime_speech_gap.gap_preceding_count()
+        return 0
+
+    def tail_gap_seconds(self):
+        if self.runtime_speech_gap is not None:
+            return self.runtime_speech_gap.tail_gap_seconds()
+        return 1.0
+
+    def vad_options(self):
+        return VadOptions(
+            threshold=self.vad_threshold(),
+            min_speech_duration_ms=round(self.vad_min_speech_seconds() * 1000),
+            min_silence_duration_ms=round(self.vad_min_silence_seconds() * 1000),
+            speech_pad_ms=150,
+        )
+
+    def vad_threshold(self):
+        if self.runtime_speech_gap is not None:
+            return self.runtime_speech_gap.vad_threshold()
+        return 0.5
+
+    def vad_min_speech_seconds(self):
+        if self.runtime_speech_gap is not None:
+            return self.runtime_speech_gap.vad_min_speech_seconds()
+        return 0.15
+
+    def vad_min_silence_seconds(self):
+        if self.runtime_speech_gap is not None:
+            return self.runtime_speech_gap.vad_min_silence_seconds()
+        return 0.5
+
+    def clip_margin_seconds(self):
+        if self.runtime_speech_gap is not None:
+            return self.runtime_speech_gap.clip_margin_seconds()
+        return 1.0
+
     def detect_file(self, wav, idx):
         audio = read_vad_audio(wav)
         chunk_offset = idx * self.segment_seconds
         chunk_base = self.audio_started_at + chunk_offset
         speeches = get_speech_timestamps(
-            audio, self.vad_options, sampling_rate=16000
+            audio, self.vad_options(), sampling_rate=16000
         )
         for speech in speeches:
             segment_start = speech["start"] / 16000.0
@@ -1112,6 +1551,10 @@ class SpeechDetector(threading.Thread):
             if self.pending is not None:
                 rows.append(dict(self.pending))
             return rows, self.known_offset
+
+    def raw_snapshot(self):
+        with self._state_lock:
+            return [dict(row) for row in self.raw_segments], self.known_offset
 
     def run(self):
         while not self.stop_event.is_set():
@@ -1300,16 +1743,60 @@ def build_html(output, channel, highlights, duration=HIGHLIGHT_SECONDS,
                 0.0,
                 float(item["trigger_start"]) + timeline_offset_seconds,
             )
+        trigger_speech_label = ""
+        if item.get("trigger_speech_video_seconds") is not None:
+            trigger_speech_label = (
+                "・直前の発話: 動画内 "
+                f'{float(item["trigger_speech_video_seconds"]):.1f}秒'
+            )
+        linked_utterance_label = ""
+        if (item.get("linked_preceding_count") is not None
+                or item.get("linked_follow_up_count") is not None):
+            linked_utterance_label = (
+                "・連結: 前方 "
+                f'{int(item.get("linked_preceding_count", 0) or 0)}個'
+                "／後方 "
+                f'{int(item.get("linked_follow_up_count", 0) or 0)}個'
+            )
+        decision_label = ""
+        if item.get("decision_speech_gap_seconds") is not None:
+            decision_label = (
+                "判定: Speech gap "
+                f'{float(item["decision_speech_gap_seconds"]):g}秒・'
+                "後方間隔 "
+                f'{float(item.get("decision_tail_gap_seconds", 1)) :g}秒未満・'
+                "余白 "
+                f'{float(item.get("decision_clip_margin_seconds", 1)) :g}秒'
+            )
+            if item.get("decision_vad_min_speech_seconds") is not None:
+                decision_label += (
+                    "・VAD 閾値 "
+                    f'{float(item.get("decision_vad_threshold", 0.5)):g}'
+                    "・最短発話 "
+                    f'{float(item["decision_vad_min_speech_seconds"]):g}秒'
+                    "・最短無音 "
+                    f'{float(item.get("decision_vad_min_silence_seconds", 0.5)):g}秒'
+                )
+            front_reason = str(item.get("linked_preceding_reason", ""))
+            back_reason = str(item.get("linked_follow_up_reason", ""))
+            if front_reason:
+                decision_label += f"／前方: {front_reason}"
+            if back_reason:
+                decision_label += f"／後方: {back_reason}"
         cards.append(
             f'<section class="highlight" data-rank="{rank}" '
             f'data-start-seconds="{timeline_start:.3f}" '
             f'data-video-status="{html.escape(video_status)}">'
             f'<h2>{rank}位</h2>'
             f'{video_html}'
-            f'<div class="highlight-meta">配信開始から '
+            f'<div class="highlight-meta">'
             f'{format_elapsed(timeline_start)}〜'
             f'{format_elapsed(timeline_start + item_duration)}・'
-            f'チャット {item["chat_count"]}件</div>'
+            f'チャット {item["chat_count"]}件'
+            f'<span class="decision-info">{trigger_speech_label}</span></div>'
+            f'<div class="highlight-meta decision-info">{linked_utterance_label}</div>'
+            f'<div class="highlight-meta decision-info">'
+            f'{html.escape(decision_label)}</div>'
             '</section>'
         )
     if not cards:
@@ -1768,7 +2255,7 @@ def main():
             speech_provider=speech_detector,
             clip_min_seconds=args.clip_min_seconds,
             clip_max_seconds=args.clip_max_seconds,
-            clip_end_silence_seconds=args.utterance_gap_seconds,
+            clip_end_silence_seconds=1.0,
             clip_end_margin_seconds=args.clip_margin_seconds,
         )
         stream_started_at = args.stream_started_at
